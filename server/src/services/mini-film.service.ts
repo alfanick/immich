@@ -142,6 +142,7 @@ export class MiniFilmService extends BaseService {
 
     await fs.mkdir(inputDir, { recursive: true });
     await fs.mkdir(outputDir, { recursive: true });
+    await this.ensureMiniFilmRuntimeDirs(config);
     await this.symlinkInputs(inputDir, assets);
 
     const args = [
@@ -179,7 +180,7 @@ export class MiniFilmService extends BaseService {
       state.reviewSessions[id] = session;
     });
 
-    const child = spawn(config.binaryPath, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(config.binaryPath, args, { stdio: ['ignore', 'pipe', 'pipe'], env: this.miniFilmEnv(config) });
     this.reviewProcesses.set(id, child);
     child.stdout.on('data', (chunk) => void this.appendReviewLog(id, chunk.toString()));
     child.stderr.on('data', (chunk) => void this.appendReviewLog(id, chunk.toString()));
@@ -263,6 +264,7 @@ export class MiniFilmService extends BaseService {
     const publishDir = this.resolveInside(session.outputDir, publishAlbum);
     const albumName = dto.albumName || session.name;
     await fs.mkdir(publishDir, { recursive: true });
+    await this.ensureMiniFilmRuntimeDirs(config);
     const album = await BaseService.create(AlbumService, this).create(auth, {
       albumName,
       assetIds: [],
@@ -330,6 +332,7 @@ export class MiniFilmService extends BaseService {
     const outputDir = path.join(path.resolve(config.workRoot), auth.user.id, id, 'apply-output');
     const albumName = dto.albumName || `mini-film apply ${createdAt}`;
     await fs.mkdir(outputDir, { recursive: true });
+    await this.ensureMiniFilmRuntimeDirs(config);
     const album = await BaseService.create(AlbumService, this).create(auth, {
       albumName,
       assetIds: [],
@@ -457,6 +460,7 @@ export class MiniFilmService extends BaseService {
     profiles: string[],
   ) {
     try {
+      await this.ensureMiniFilmRuntimeDirs(config);
       await this.patchApplyJob(id, (job) => ({ ...job, status: 'running', updatedAt: new Date().toISOString() }));
       const job = await this.findApplyJob(id);
       if (!job.albumId) {
@@ -469,7 +473,9 @@ export class MiniFilmService extends BaseService {
         for (const [profileIndex, profile] of selectedProfiles.entries()) {
           const output = this.applyOutputPath(job.outputDir, asset, profile, profileIndex, config, dto);
           const args = ['apply', asset.originalPath, '--output', output, ...this.applyArgs(config, dto, profile)];
-          await this.runProcess(config.binaryPath, args, (text) => void this.appendApplyLog(id, text));
+          await this.runProcess(config.binaryPath, args, (text) => void this.appendApplyLog(id, text), {
+            env: this.miniFilmEnv(config),
+          });
           const importedAssetId = await this.importGeneratedFileToAlbum(auth, output, job.albumId);
           if (importedAssetId && !importedAssetIds.includes(importedAssetId)) {
             importedAssetIds.push(importedAssetId);
@@ -538,10 +544,14 @@ export class MiniFilmService extends BaseService {
       const session = await this.findReviewSession(id);
       const args = this.reviewPublishArgs(session, config, publishAlbum, dto, true);
       await fs.mkdir(publishDir, { recursive: true });
+      await this.ensureMiniFilmRuntimeDirs(config);
       await this.appendReviewLog(id, `$ ${[config.binaryPath, ...args].join(' ')}\n`);
 
       const publish = new Promise<void>((resolve, reject) => {
-        const child = spawn(config.binaryPath, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+        const child = spawn(config.binaryPath, args, {
+          stdio: ['ignore', 'pipe', 'pipe'],
+          env: this.miniFilmEnv(config),
+        });
         this.reviewImportProcesses.set(id, child);
         child.stdout.on('data', (chunk) => {
           void this.appendReviewLog(id, chunk.toString());
@@ -1178,10 +1188,15 @@ export class MiniFilmService extends BaseService {
     });
   }
 
-  private runProcess(binary: string, args: string[], onOutput: (text: string) => void): Promise<void> {
+  private runProcess(
+    binary: string,
+    args: string[],
+    onOutput: (text: string) => void,
+    options: { env?: NodeJS.ProcessEnv } = {},
+  ): Promise<void> {
     return new Promise((resolve, reject) => {
       onOutput(`$ ${[binary, ...args].join(' ')}\n`);
-      const child = spawn(binary, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+      const child = spawn(binary, args, { stdio: ['ignore', 'pipe', 'pipe'], env: options.env });
       child.stdout.on('data', (chunk) => onOutput(chunk.toString()));
       child.stderr.on('data', (chunk) => onOutput(chunk.toString()));
       child.on('error', (error) => reject(error));
@@ -1212,6 +1227,40 @@ export class MiniFilmService extends BaseService {
       throw new BadRequestException('mini-film path escapes the session output folder');
     }
     return resolved;
+  }
+
+  private async ensureMiniFilmRuntimeDirs(config: MiniFilmConfig) {
+    await Promise.all([
+      fs.mkdir(this.miniFilmHome(config), { recursive: true }),
+      fs.mkdir(this.miniFilmConfigHome(config), { recursive: true }),
+      fs.mkdir(this.miniFilmCacheHome(config), { recursive: true }),
+      fs.mkdir(this.effectiveHaldDir(config), { recursive: true }),
+    ]);
+  }
+
+  private miniFilmEnv(config: MiniFilmConfig): NodeJS.ProcessEnv {
+    return {
+      ...process.env,
+      HOME: this.miniFilmHome(config),
+      XDG_CONFIG_HOME: this.miniFilmConfigHome(config),
+      XDG_CACHE_HOME: this.miniFilmCacheHome(config),
+    };
+  }
+
+  private miniFilmRuntimeRoot(config: MiniFilmConfig): string {
+    return path.join(path.resolve(config.workRoot), 'runtime');
+  }
+
+  private miniFilmHome(config: MiniFilmConfig): string {
+    return path.join(this.miniFilmRuntimeRoot(config), 'home');
+  }
+
+  private miniFilmConfigHome(config: MiniFilmConfig): string {
+    return path.join(this.miniFilmRuntimeRoot(config), 'config');
+  }
+
+  private miniFilmCacheHome(config: MiniFilmConfig): string {
+    return path.join(this.miniFilmRuntimeRoot(config), 'cache');
   }
 
   private applySkipReason(asset: Asset): string {
