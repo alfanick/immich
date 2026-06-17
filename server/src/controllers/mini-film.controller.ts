@@ -1,7 +1,7 @@
 import { All, Body, Controller, Delete, Get, HttpCode, HttpStatus, Param, Post, Query, Req, Res } from '@nestjs/common';
 import { ApiTags } from '@nestjs/swagger';
 import { Request, Response } from 'express';
-import http from 'node:http';
+import http, { type IncomingHttpHeaders, type IncomingMessage, type OutgoingHttpHeaders } from 'node:http';
 import { Endpoint, HistoryBuilder } from 'src/decorators';
 import { AuthDto } from 'src/dtos/auth.dto';
 import {
@@ -75,7 +75,7 @@ export class MiniFilmController {
   @Endpoint({
     summary: 'Import mini-film review outputs',
     description:
-      'Publish a mini-film review session, import generated images into Immich, create an album, then stop the daemon.',
+      'Publish a mini-film review session in the background and stream generated images into a new Immich album.',
     history: new HistoryBuilder().added('v1'),
   })
   importReviewSession(
@@ -147,15 +147,15 @@ export class MiniFilmController {
     const { port } = await this.service.getReviewProxyTarget(auth, id);
     const targetPath = this.getProxyPath(req.originalUrl, id);
     const body = this.getProxyBody(req);
-    const headers = { ...req.headers };
-    delete headers.host;
-    delete headers.connection;
-    delete headers['content-length'];
-    if (body) {
-      headers['content-length'] = String(body.length);
-      headers['content-type'] = headers['content-type'] || 'application/json';
+    const isEventStream = req.method === 'GET' && targetPath.startsWith('/api/events');
+    const headers = this.getProxyRequestHeaders(req.headers, body, isEventStream);
+
+    if (isEventStream) {
+      req.setTimeout(0);
+      res.setTimeout(0);
     }
 
+    let upstreamResponse: IncomingMessage | undefined;
     const proxyRequest = http.request(
       {
         hostname: '127.0.0.1',
@@ -165,15 +165,31 @@ export class MiniFilmController {
         headers,
       },
       (proxyResponse) => {
+        upstreamResponse = proxyResponse;
         res.status(proxyResponse.statusCode ?? 502);
-        for (const [key, value] of Object.entries(proxyResponse.headers)) {
+        for (const [key, value] of Object.entries(this.getProxyResponseHeaders(proxyResponse.headers, isEventStream))) {
           if (value !== undefined) {
             res.setHeader(key, value);
           }
         }
+        if (isEventStream) {
+          res.setHeader('content-type', 'text/event-stream');
+          res.setHeader('cache-control', 'no-cache, no-transform');
+          res.setHeader('x-accel-buffering', 'no');
+          res.flushHeaders();
+        }
         proxyResponse.pipe(res);
       },
     );
+
+    if (isEventStream) {
+      const closeUpstream = () => {
+        proxyRequest.destroy();
+        upstreamResponse?.destroy();
+      };
+      req.on('aborted', closeUpstream);
+      res.on('close', closeUpstream);
+    }
 
     proxyRequest.on('error', (error) => {
       if (res.headersSent) {
@@ -185,6 +201,8 @@ export class MiniFilmController {
 
     if (body) {
       proxyRequest.end(body);
+    } else if (req.method === 'GET' || req.method === 'HEAD') {
+      proxyRequest.end();
     } else {
       req.pipe(proxyRequest);
     }
@@ -210,5 +228,45 @@ export class MiniFilmController {
     if (req.body && Object.keys(req.body).length > 0) {
       return Buffer.from(JSON.stringify(req.body));
     }
+  }
+
+  private getProxyRequestHeaders(
+    requestHeaders: IncomingHttpHeaders,
+    body: Buffer | undefined,
+    isEventStream: boolean,
+  ): OutgoingHttpHeaders {
+    const headers: OutgoingHttpHeaders = { ...requestHeaders };
+    this.removeHopByHopHeaders(headers);
+    delete headers.host;
+    delete headers['content-length'];
+    if (body) {
+      headers['content-length'] = String(body.length);
+      headers['content-type'] = headers['content-type'] || 'application/json';
+    }
+    if (isEventStream) {
+      headers.accept = 'text/event-stream';
+      headers['cache-control'] = 'no-cache';
+    }
+    return headers;
+  }
+
+  private getProxyResponseHeaders(responseHeaders: IncomingHttpHeaders, isEventStream: boolean): OutgoingHttpHeaders {
+    const headers: OutgoingHttpHeaders = { ...responseHeaders };
+    this.removeHopByHopHeaders(headers);
+    if (isEventStream) {
+      delete headers['content-length'];
+    }
+    return headers;
+  }
+
+  private removeHopByHopHeaders(headers: OutgoingHttpHeaders) {
+    delete headers.connection;
+    delete headers['keep-alive'];
+    delete headers['proxy-authenticate'];
+    delete headers['proxy-authorization'];
+    delete headers.te;
+    delete headers.trailer;
+    delete headers['transfer-encoding'];
+    delete headers.upgrade;
   }
 }

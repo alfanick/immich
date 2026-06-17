@@ -12,6 +12,7 @@ import path from 'node:path';
 import sanitize from 'sanitize-filename';
 import { SystemConfig } from 'src/config';
 import { Asset } from 'src/database';
+import { mapAsset } from 'src/dtos/asset-response.dto';
 import { AuthDto } from 'src/dtos/auth.dto';
 import {
   MiniFilmApplyJobCreateDto,
@@ -31,7 +32,7 @@ import { BaseService } from 'src/services/base.service';
 import { mimeTypes } from 'src/utils/mime-types';
 
 type MiniFilmConfig = SystemConfig['miniFilm'];
-type MiniFilmStatus = 'starting' | 'running' | 'stopped' | 'failed' | 'imported';
+type MiniFilmStatus = 'starting' | 'running' | 'stopped' | 'failed' | 'importing' | 'imported';
 type MiniFilmApplyStatus = 'queued' | 'running' | 'completed' | 'failed';
 
 type MiniFilmSkippedAsset = {
@@ -101,10 +102,13 @@ type ProfileNodeMutable = {
 };
 
 const MAX_LOG_LENGTH = 64 * 1024;
+const IMPORT_SCAN_INTERVAL_MS = 1000;
+const IMPORT_STABLE_DELAY_MS = 750;
 
 @Injectable()
 export class MiniFilmService extends BaseService {
   private reviewProcesses = new Map<string, ChildProcess>();
+  private reviewImportProcesses = new Map<string, ChildProcess>();
 
   async getProfileTree(auth: AuthDto, includeAll = false): Promise<MiniFilmProfileTreeDto> {
     if (includeAll && !auth.user.isAdmin) {
@@ -201,6 +205,7 @@ export class MiniFilmService extends BaseService {
   async stopReviewSession(auth: AuthDto, id: string): Promise<void> {
     const session = await this.findReviewSession(id);
     this.assertCanSee(auth, session.userId);
+    this.stopReviewImportProcess(id);
     this.stopReviewProcess(id);
     await this.patchReviewSession(id, (current) => ({
       ...current,
@@ -212,6 +217,7 @@ export class MiniFilmService extends BaseService {
   async deleteReviewSession(auth: AuthDto, id: string): Promise<void> {
     const session = await this.findReviewSession(id);
     this.assertCanSee(auth, session.userId);
+    this.stopReviewImportProcess(id);
     this.stopReviewProcess(id);
     await this.updateState((state) => {
       delete state.reviewSessions[id];
@@ -227,41 +233,58 @@ export class MiniFilmService extends BaseService {
     const session = await this.findReviewSession(id);
     this.assertCanSee(auth, session.userId);
 
+    if (session.status === 'importing' && session.importedAlbumId) {
+      return {
+        albumId: session.importedAlbumId,
+        assetIds: session.importedAssetIds ?? [],
+        imported: session.importedAssetIds?.length ?? 0,
+        session,
+      };
+    }
+
+    if (session.status === 'imported' && session.importedAlbumId) {
+      return {
+        albumId: session.importedAlbumId,
+        assetIds: session.importedAssetIds ?? [],
+        imported: session.importedAssetIds?.length ?? 0,
+        session,
+      };
+    }
+
+    if (session.status !== 'running') {
+      throw new BadRequestException(this.reviewUnavailableMessage(session));
+    }
+
+    if (!(await this.fileExists(session.statePath))) {
+      throw new BadRequestException(`mini-film review state is not ready at ${session.statePath}`);
+    }
+
     const publishAlbum = this.publishAlbumName(dto.publishAlbum ?? session.publishAlbum ?? config.publishAlbum);
-    await this.runReviewPublish(session, config, publishAlbum, dto);
-
     const publishDir = this.resolveInside(session.outputDir, publishAlbum);
-    const files = await this.collectImportableImages(publishDir);
-    if (files.length === 0) {
-      throw new BadRequestException(`No mini-film outputs found in ${publishDir}`);
-    }
-
-    const importedAssetIds = await this.importGeneratedFiles(auth, files);
-    if (importedAssetIds.length === 0) {
-      throw new BadRequestException(`No mini-film outputs were imported from ${publishDir}`);
-    }
-
     const albumName = dto.albumName || session.name;
+    await fs.mkdir(publishDir, { recursive: true });
     const album = await BaseService.create(AlbumService, this).create(auth, {
       albumName,
-      assetIds: importedAssetIds,
+      assetIds: [],
       albumUsers: [{ userId: auth.user.id, role: AlbumUserRole.Owner }],
     });
 
     await this.patchReviewSession(id, (current) => ({
       ...current,
-      status: 'imported',
+      status: 'importing',
+      publishAlbum,
       importedAlbumId: album.id,
-      importedAssetIds,
+      importedAssetIds: current.importedAssetIds ?? [],
       updatedAt: new Date().toISOString(),
     }));
-    this.stopReviewProcess(id);
+
+    void this.runReviewImportJob(auth, id, config, dto, publishAlbum, publishDir, album.id);
 
     const updated = await this.getReviewSession(auth, id);
     return {
       albumId: album.id,
-      assetIds: importedAssetIds,
-      imported: importedAssetIds.length,
+      assetIds: updated.importedAssetIds ?? [],
+      imported: updated.importedAssetIds?.length ?? 0,
       session: updated,
     };
   }
@@ -305,7 +328,13 @@ export class MiniFilmService extends BaseService {
     const id = this.cryptoRepository.randomUUID();
     const createdAt = new Date().toISOString();
     const outputDir = path.join(path.resolve(config.workRoot), auth.user.id, id, 'apply-output');
+    const albumName = dto.albumName || `mini-film apply ${createdAt}`;
     await fs.mkdir(outputDir, { recursive: true });
+    const album = await BaseService.create(AlbumService, this).create(auth, {
+      albumName,
+      assetIds: [],
+      albumUsers: [{ userId: auth.user.id, role: AlbumUserRole.Owner }],
+    });
 
     const total = rawAssets.length * Math.max(profiles.length, 1);
     const job: StoredApplyJob = {
@@ -322,7 +351,9 @@ export class MiniFilmService extends BaseService {
       processed: 0,
       total,
       logs: '',
-      albumName: dto.albumName || `mini-film apply ${createdAt}`,
+      albumName,
+      albumId: album.id,
+      importedAssetIds: [],
     };
 
     await this.updateState((state) => {
@@ -428,7 +459,10 @@ export class MiniFilmService extends BaseService {
     try {
       await this.patchApplyJob(id, (job) => ({ ...job, status: 'running', updatedAt: new Date().toISOString() }));
       const job = await this.findApplyJob(id);
-      const outputFiles: string[] = [];
+      if (!job.albumId) {
+        throw new InternalServerErrorException('mini-film apply album was not created');
+      }
+      const importedAssetIds = [...(job.importedAssetIds ?? [])];
       const selectedProfiles = profiles.length > 0 ? profiles : [undefined];
 
       for (const asset of rawAssets) {
@@ -436,26 +470,23 @@ export class MiniFilmService extends BaseService {
           const output = this.applyOutputPath(job.outputDir, asset, profile, profileIndex, config, dto);
           const args = ['apply', asset.originalPath, '--output', output, ...this.applyArgs(config, dto, profile)];
           await this.runProcess(config.binaryPath, args, (text) => void this.appendApplyLog(id, text));
-          outputFiles.push(output);
+          const importedAssetId = await this.importGeneratedFileToAlbum(auth, output, job.albumId);
+          if (importedAssetId && !importedAssetIds.includes(importedAssetId)) {
+            importedAssetIds.push(importedAssetId);
+          }
           await this.patchApplyJob(id, (current) => ({
             ...current,
             processed: current.processed + 1,
+            importedAssetIds,
             updatedAt: new Date().toISOString(),
           }));
         }
       }
 
-      const importedAssetIds = await this.importGeneratedFiles(auth, outputFiles);
-      const album = await BaseService.create(AlbumService, this).create(auth, {
-        albumName: job.albumName,
-        assetIds: importedAssetIds,
-        albumUsers: [{ userId: auth.user.id, role: AlbumUserRole.Owner }],
-      });
-
       await this.patchApplyJob(id, (current) => ({
         ...current,
         status: 'completed',
-        albumId: album.id,
+        albumId: job.albumId,
         importedAssetIds,
         updatedAt: new Date().toISOString(),
       }));
@@ -470,18 +501,115 @@ export class MiniFilmService extends BaseService {
     }
   }
 
-  private async runReviewPublish(
+  private async runReviewImportJob(
+    auth: AuthDto,
+    id: string,
+    config: MiniFilmConfig,
+    dto: MiniFilmReviewSessionImportDto,
+    publishAlbum: string,
+    publishDir: string,
+    albumId: string,
+  ) {
+    const importedFiles = new Set<string>();
+    const importingFiles = new Set<string>();
+    const seenFiles = new Map<string, { size: number; mtimeMs: number }>();
+    let scanPromise: Promise<void> | undefined;
+    const scan = async () => {
+      scanPromise ??= this.importReadyReviewOutputs(
+        auth,
+        id,
+        publishDir,
+        albumId,
+        importedFiles,
+        importingFiles,
+        seenFiles,
+      ).finally(() => {
+        scanPromise = undefined;
+      });
+      await scanPromise;
+    };
+    const scanSafely = () =>
+      scan().catch(
+        (error: any) => void this.appendReviewLog(id, `mini-film import scan failed: ${error?.message || error}\n`),
+      );
+
+    let interval: NodeJS.Timeout | undefined;
+    try {
+      const session = await this.findReviewSession(id);
+      const args = this.reviewPublishArgs(session, config, publishAlbum, dto, true);
+      await fs.mkdir(publishDir, { recursive: true });
+      await this.appendReviewLog(id, `$ ${[config.binaryPath, ...args].join(' ')}\n`);
+
+      const publish = new Promise<void>((resolve, reject) => {
+        const child = spawn(config.binaryPath, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+        this.reviewImportProcesses.set(id, child);
+        child.stdout.on('data', (chunk) => {
+          void this.appendReviewLog(id, chunk.toString());
+          void scanSafely();
+        });
+        child.stderr.on('data', (chunk) => void this.appendReviewLog(id, chunk.toString()));
+        child.on('error', (error) => reject(error));
+        child.on('exit', (code, signal) => {
+          if (code === 0) {
+            resolve();
+          } else {
+            reject(
+              new InternalServerErrorException(
+                `mini-film exited with code ${code ?? 'null'} signal ${signal ?? 'null'}`,
+              ),
+            );
+          }
+        });
+      });
+
+      interval = setInterval(() => void scanSafely(), IMPORT_SCAN_INTERVAL_MS);
+      await scan();
+      await publish;
+      for (let index = 0; index < 3; index++) {
+        await this.sleep(IMPORT_STABLE_DELAY_MS);
+        await scan();
+      }
+
+      const updated = await this.findReviewSession(id);
+      const importedAssetIds = updated.importedAssetIds ?? [];
+      if (importedAssetIds.length === 0) {
+        throw new BadRequestException(`No mini-film outputs were imported from ${publishDir}`);
+      }
+
+      await this.patchReviewSession(id, (current) => ({
+        ...current,
+        status: 'imported',
+        importedAlbumId: albumId,
+        importedAssetIds,
+        updatedAt: new Date().toISOString(),
+      }));
+      this.stopReviewProcess(id);
+    } catch (error: any) {
+      this.stopReviewImportProcess(id);
+      await this.appendReviewLog(id, `${error?.message || error}\n`);
+      await this.patchReviewSession(id, (session) => ({
+        ...session,
+        status: session.status === 'stopped' ? 'stopped' : 'failed',
+        updatedAt: new Date().toISOString(),
+      }));
+    } finally {
+      if (interval) {
+        clearInterval(interval);
+      }
+      this.reviewImportProcesses.delete(id);
+    }
+  }
+
+  private reviewPublishArgs(
     session: StoredReviewSession,
     config: MiniFilmConfig,
     publishAlbum: string,
     dto: MiniFilmReviewSessionImportDto,
-  ) {
-    if (!(await this.fileExists(session.statePath))) {
-      throw new BadRequestException(`mini-film review state is not ready at ${session.statePath}`);
-    }
-
+    progressEvents = false,
+  ): string[] {
     const args = [
       'review-publish',
+      ...(progressEvents ? ['--progress-events'] : []),
       '--state',
       session.statePath,
       '--input-root',
@@ -504,20 +632,79 @@ export class MiniFilmService extends BaseService {
     if (dto.rerenderRaw) {
       args.push('--rerender-raw');
     }
-
-    await this.runProcess(config.binaryPath, args, (text) => void this.appendReviewLog(session.id, text));
+    return args;
   }
 
-  private async importGeneratedFiles(auth: AuthDto, files: string[]): Promise<string[]> {
-    const assetService = BaseService.create(AssetMediaService, this);
-    const assetIds: string[] = [];
+  private async importReadyReviewOutputs(
+    auth: AuthDto,
+    id: string,
+    publishDir: string,
+    albumId: string,
+    importedFiles: Set<string>,
+    importingFiles: Set<string>,
+    seenFiles: Map<string, { size: number; mtimeMs: number }>,
+  ) {
+    const files = await this.collectImportableImages(publishDir);
     for (const file of files) {
-      const result = await assetService.importLocalAsset(auth, file, path.basename(file));
-      if (result.id) {
-        assetIds.push(result.id);
+      const resolved = path.resolve(file);
+      if (importedFiles.has(resolved) || importingFiles.has(resolved)) {
+        continue;
+      }
+      if (!(await this.isStableImportFile(resolved, seenFiles))) {
+        continue;
+      }
+
+      importingFiles.add(resolved);
+      try {
+        const assetId = await this.importGeneratedFileToAlbum(auth, resolved, albumId, { checkStable: false });
+        if (!assetId) {
+          continue;
+        }
+        importedFiles.add(resolved);
+        await this.patchReviewSession(id, (current) => {
+          const importedAssetIds = current.importedAssetIds ?? [];
+          return {
+            ...current,
+            importedAssetIds: importedAssetIds.includes(assetId) ? importedAssetIds : [...importedAssetIds, assetId],
+            updatedAt: new Date().toISOString(),
+          };
+        });
+      } finally {
+        importingFiles.delete(resolved);
       }
     }
-    return assetIds;
+  }
+
+  private async importGeneratedFileToAlbum(
+    auth: AuthDto,
+    file: string,
+    albumId: string,
+    options: { checkStable?: boolean } = {},
+  ): Promise<string | undefined> {
+    if (options.checkStable !== false && !(await this.isStableImportFile(file))) {
+      return;
+    }
+
+    const assetService = BaseService.create(AssetMediaService, this);
+    const result = await assetService.importLocalAsset(auth, file, path.basename(file));
+    if (!result.id) {
+      return;
+    }
+
+    await BaseService.create(AlbumService, this).addAssets(auth, albumId, { ids: [result.id] });
+    await this.notifyAlbumAssetAdded(auth, albumId, result.id);
+    return result.id;
+  }
+
+  private async notifyAlbumAssetAdded(auth: AuthDto, albumId: string, assetId: string) {
+    const [asset] = await this.assetRepository.getByIdsWithAllRelationsButStacks([assetId]);
+    if (!asset) {
+      return;
+    }
+    this.websocketRepository.clientSend('on_album_asset_add', auth.user.id, {
+      albumId,
+      asset: mapAsset(asset, { auth }),
+    });
   }
 
   private applyOutputPath(
@@ -547,12 +734,13 @@ export class MiniFilmService extends BaseService {
     const files: string[] = [];
     for (const entry of entries) {
       const fullPath = path.join(root, entry.name);
-      if (entry.isDirectory()) {
+      const stat = await fs.stat(fullPath).catch(() => null);
+      if (stat?.isDirectory()) {
         if (entry.name === '.mini-film-gallery-thumbnails') {
           continue;
         }
         files.push(...(await this.collectImportableImages(fullPath)));
-      } else if (entry.isFile() && mimeTypes.isImage(fullPath)) {
+      } else if (stat?.isFile() && mimeTypes.isImage(fullPath)) {
         files.push(fullPath);
       }
     }
@@ -1057,6 +1245,17 @@ export class MiniFilmService extends BaseService {
     }
   }
 
+  private stopReviewImportProcess(id: string) {
+    const child = this.reviewImportProcesses.get(id);
+    if (!child) {
+      return;
+    }
+    this.reviewImportProcesses.delete(id);
+    if (!child.killed) {
+      child.kill('SIGTERM');
+    }
+  }
+
   private async appendReviewLog(id: string, text: string) {
     await this.patchReviewSession(id, (session) => ({
       ...session,
@@ -1089,7 +1288,7 @@ export class MiniFilmService extends BaseService {
   private async markReviewExited(id: string, code: number | null, signal: NodeJS.Signals | null) {
     this.reviewProcesses.delete(id);
     await this.patchReviewSession(id, (session) => {
-      if (session.status === 'imported') {
+      if (session.status === 'imported' || session.status === 'importing') {
         return { ...session, exitCode: code, signal, updatedAt: new Date().toISOString() };
       }
       return {
@@ -1167,5 +1366,40 @@ export class MiniFilmService extends BaseService {
       .stat(value)
       .then((stat) => stat.isFile())
       .catch(() => false);
+  }
+
+  private async isStableImportFile(
+    value: string,
+    seenFiles?: Map<string, { size: number; mtimeMs: number }>,
+  ): Promise<boolean> {
+    const first = await fs.stat(value).catch(() => null);
+    if (!first?.isFile() || first.size <= 0) {
+      return false;
+    }
+
+    if (seenFiles) {
+      const current = { size: first.size, mtimeMs: first.mtimeMs };
+      const previous = seenFiles.get(value);
+      seenFiles.set(value, current);
+      return Boolean(
+        previous &&
+        previous.size === current.size &&
+        previous.mtimeMs === current.mtimeMs &&
+        Date.now() - current.mtimeMs >= IMPORT_STABLE_DELAY_MS,
+      );
+    }
+
+    await this.sleep(IMPORT_STABLE_DELAY_MS);
+    const second = await fs.stat(value).catch(() => null);
+    return Boolean(
+      second?.isFile() &&
+      second.size === first.size &&
+      second.mtimeMs === first.mtimeMs &&
+      Date.now() - second.mtimeMs >= IMPORT_STABLE_DELAY_MS,
+    );
+  }
+
+  private sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
   }
 }

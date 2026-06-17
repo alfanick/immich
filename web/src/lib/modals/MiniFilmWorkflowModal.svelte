@@ -82,7 +82,7 @@
       if (reviewSession) {
         const result = await importMiniFilmReviewSession(reviewSession.id, albumName || undefined);
         toastManager.primary({
-          description: `Imported ${result.imported} mini-film output${result.imported === 1 ? '' : 's'}`,
+          description: 'mini-film import started',
           button: { label: $t('view_album'), onclick: () => goto(Route.viewAlbum({ id: result.albumId })) },
         });
         onClose(true);
@@ -109,11 +109,18 @@
           profiles,
           albumName: albumName || undefined,
         });
-        toastManager.primary(
-          `mini-film apply queued for ${job.rawAssetIds.length} RAW asset${job.rawAssetIds.length === 1 ? '' : 's'}${
-            job.skippedAssets.length > 0 ? `, skipped ${job.skippedAssets.length}` : ''
-          }`,
-        );
+        const description = `mini-film apply queued for ${job.rawAssetIds.length} RAW asset${job.rawAssetIds.length === 1 ? '' : 's'}${
+          job.skippedAssets.length > 0 ? `, skipped ${job.skippedAssets.length}` : ''
+        }`;
+        if (job.albumId) {
+          const albumId = job.albumId;
+          toastManager.primary({
+            description,
+            button: { label: $t('view_album'), onclick: () => goto(Route.viewAlbum({ id: albumId })) },
+          });
+        } else {
+          toastManager.primary(description);
+        }
       }
       onClose(true);
     } catch (error) {

@@ -47,10 +47,19 @@
   import { getGlobalActions } from '$lib/services/app.service';
   import { getAssetBulkActions } from '$lib/services/asset.service';
   import { SlideshowNavigation, SlideshowState, slideshowStore } from '$lib/stores/slideshow.store';
+  import { websocketEvents } from '$lib/stores/websocket';
   import { handlePromiseError } from '$lib/utils';
   import { handleError } from '$lib/utils/handle-error';
   import { isAlbumsRoute, navigate, type AssetGridRouteSearchParams } from '$lib/utils/navigation';
-  import { AlbumUserRole, AssetVisibility, getAlbumInfo, updateAlbumInfo, type AlbumResponseDto } from '@immich/sdk';
+  import { toTimelineAsset } from '$lib/utils/timeline-util';
+  import {
+    AlbumUserRole,
+    AssetVisibility,
+    getAlbumInfo,
+    updateAlbumInfo,
+    type AlbumResponseDto,
+    type AssetResponseDto,
+  } from '@immich/sdk';
   import {
     ActionButton,
     CommandPaletteDefaultProvider,
@@ -91,6 +100,7 @@
   let oldAt: AssetGridRouteSearchParams | null | undefined = $state();
   let viewMode: AlbumPageViewMode = $state(AlbumPageViewMode.VIEW);
   let timelineManager = $state<TimelineManager>() as TimelineManager;
+  let pendingMiniFilmAlbumAssets = $state<AssetResponseDto[]>([]);
   let showAlbumUsers = $derived(timelineManager?.showAssetOwners ?? false);
 
   const timelineMultiSelectManager = new AssetMultiSelectManager();
@@ -242,7 +252,12 @@
     handlePromiseError(activityManager.init(album.id));
   });
 
-  onDestroy(() => activityManager.reset());
+  onDestroy(() => {
+    unsubscribeMiniFilmAlbumAsset();
+    unsubscribeMiniFilmUpload();
+    unsubscribeMiniFilmAssetUpdate();
+    activityManager.reset();
+  });
 
   const isOwned = $derived(album.albumUsers[0].user.id === authManager.user.id);
 
@@ -314,6 +329,64 @@
 
     await invalidate('album:data');
   };
+
+  const queueMiniFilmAlbumAsset = (asset: AssetResponseDto) => {
+    const existingIndex = pendingMiniFilmAlbumAssets.findIndex(({ id }) => id === asset.id);
+    if (existingIndex === -1) {
+      pendingMiniFilmAlbumAssets = [...pendingMiniFilmAlbumAssets, asset];
+      return;
+    }
+
+    pendingMiniFilmAlbumAssets = [
+      ...pendingMiniFilmAlbumAssets.slice(0, existingIndex),
+      asset,
+      ...pendingMiniFilmAlbumAssets.slice(existingIndex + 1),
+    ];
+  };
+
+  const upsertMiniFilmAlbumAsset = (asset: AssetResponseDto) => {
+    if (!timelineManager) {
+      queueMiniFilmAlbumAsset(asset);
+      return;
+    }
+
+    const isNewAlbumAsset = !timelineManager.albumAssets.has(asset.id);
+    timelineManager.albumAssets.add(asset.id);
+    timelineManager.upsertAssets([toTimelineAsset(asset)]);
+    if (isNewAlbumAsset) {
+      album = { ...album, assetCount: album.assetCount + 1 };
+    }
+  };
+
+  $effect(() => {
+    if (!timelineManager || pendingMiniFilmAlbumAssets.length === 0) {
+      return;
+    }
+
+    const pending = pendingMiniFilmAlbumAssets;
+    pendingMiniFilmAlbumAssets = [];
+    for (const asset of pending) {
+      upsertMiniFilmAlbumAsset(asset);
+    }
+  });
+
+  const unsubscribeMiniFilmAlbumAsset = websocketEvents.on('on_album_asset_add', ({ albumId: eventAlbumId, asset }) => {
+    if (eventAlbumId === album.id) {
+      upsertMiniFilmAlbumAsset(asset);
+    }
+  });
+
+  const unsubscribeMiniFilmUpload = websocketEvents.on('on_upload_success', (asset) => {
+    if (timelineManager?.albumAssets.has(asset.id) || pendingMiniFilmAlbumAssets.some(({ id }) => id === asset.id)) {
+      upsertMiniFilmAlbumAsset(asset);
+    }
+  });
+
+  const unsubscribeMiniFilmAssetUpdate = websocketEvents.on('on_asset_update', (asset) => {
+    if (timelineManager?.albumAssets.has(asset.id) || pendingMiniFilmAlbumAssets.some(({ id }) => id === asset.id)) {
+      upsertMiniFilmAlbumAsset(asset);
+    }
+  });
 
   const { Cast } = $derived(getGlobalActions($t));
   const { Share } = $derived(getAlbumActions($t, album));

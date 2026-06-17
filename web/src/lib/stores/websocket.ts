@@ -31,6 +31,7 @@ export interface Events {
   on_asset_hidden: (assetId: string) => void;
   on_asset_restore: (assetIds: string[]) => void;
   on_asset_stack_update: (assetIds: string[]) => void;
+  on_album_asset_add: (event: { albumId: string; asset: AssetResponseDto }) => void;
   on_person_thumbnail: (personId: string) => void;
   on_server_version: (serverVersion: ServerVersionResponseDto) => void;
   on_config_update: () => void;

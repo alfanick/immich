@@ -93,7 +93,7 @@ const MiniFilmSkippedAssetSchema = z
   })
   .meta({ id: 'MiniFilmSkippedAssetDto' });
 
-const MiniFilmReviewSessionStatusSchema = z.enum(['starting', 'running', 'stopped', 'failed', 'imported']);
+const MiniFilmReviewSessionStatusSchema = z.enum(['starting', 'running', 'stopped', 'failed', 'importing', 'imported']);
 const MiniFilmApplyJobStatusSchema = z.enum(['queued', 'running', 'completed', 'failed']);
 
 const MiniFilmReviewSessionResponseSchema = z

@@ -25,9 +25,11 @@ export type MiniFilmSkippedAsset = {
 export type MiniFilmReviewSession = {
   id: string;
   name: string;
-  status: 'starting' | 'running' | 'stopped' | 'failed' | 'imported';
+  status: 'starting' | 'running' | 'stopped' | 'failed' | 'importing' | 'imported';
   reviewUrl: string;
   skippedAssets: MiniFilmSkippedAsset[];
+  importedAlbumId?: string;
+  importedAssetIds?: string[];
 };
 
 export type MiniFilmApplyJob = {
@@ -36,6 +38,8 @@ export type MiniFilmApplyJob = {
   skippedAssets: MiniFilmSkippedAsset[];
   rawAssetIds: string[];
   total: number;
+  albumId?: string;
+  importedAssetIds?: string[];
 };
 
 export type MiniFilmImportResult = {
