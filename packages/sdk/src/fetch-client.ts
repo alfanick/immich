@@ -2487,6 +2487,37 @@ export type SystemConfigFacesDto = {
 export type SystemConfigMetadataDto = {
     faces: SystemConfigFacesDto;
 };
+export type SystemConfigMiniFilmDto = {
+    enabled: boolean;
+    binaryPath: string;
+    workRoot: string;
+    profilesRoot: string;
+    haldDir: string;
+    lcpRoot: string;
+    rawtherapeePath: string;
+    convertPath: string;
+    allowedProfiles: string[];
+    defaultProfiles: string[];
+    maxJobs: number;
+    defaultJobs: number;
+    reviewPortStart: number;
+    reviewPortEnd: number;
+    outputFormat: 'jpg' | 'tiff';
+    jpgQuality: number;
+    jpegSubsampling: 's444' | 's422' | 's420';
+    progressive: boolean;
+    stripMetadata: boolean;
+    longEdge: number;
+    gallery: 'modern' | 'soft' | 'compact' | 'hero' | 'phone' | 'all' | '';
+    galleryThumbnailLongEdge: number;
+    galleryColumns: number;
+    publishAlbum: string;
+    noGrain: boolean;
+    colorNoiseIsoThreshold: number;
+    lensCorrections: string;
+    grainPreset: '' | 'light' | 'medium' | 'heavy';
+    grain: string;
+};
 export type SystemConfigNewVersionCheckDto = {
     channel: ReleaseChannel;
     /** Enabled */
@@ -2612,6 +2643,7 @@ export type SystemConfigDto = {
     machineLearning: SystemConfigMachineLearningDto;
     map: SystemConfigMapDto;
     metadata: SystemConfigMetadataDto;
+    miniFilm: SystemConfigMiniFilmDto;
     newVersionCheck: SystemConfigNewVersionCheckDto;
     nightlyTasks: SystemConfigNightlyTasksDto;
     notifications: SystemConfigNotificationsDto;

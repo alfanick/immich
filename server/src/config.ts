@@ -115,6 +115,37 @@ export type SystemConfig = {
       import: boolean;
     };
   };
+  miniFilm: {
+    enabled: boolean;
+    binaryPath: string;
+    workRoot: string;
+    profilesRoot: string;
+    haldDir: string;
+    lcpRoot: string;
+    rawtherapeePath: string;
+    convertPath: string;
+    allowedProfiles: string[];
+    defaultProfiles: string[];
+    maxJobs: number;
+    defaultJobs: number;
+    reviewPortStart: number;
+    reviewPortEnd: number;
+    outputFormat: 'jpg' | 'tiff';
+    jpgQuality: number;
+    jpegSubsampling: 's444' | 's422' | 's420';
+    progressive: boolean;
+    stripMetadata: boolean;
+    longEdge: number;
+    gallery: 'modern' | 'soft' | 'compact' | 'hero' | 'phone' | 'all' | '';
+    galleryThumbnailLongEdge: number;
+    galleryColumns: number;
+    publishAlbum: string;
+    noGrain: boolean;
+    colorNoiseIsoThreshold: number;
+    lensCorrections: string;
+    grainPreset: '' | 'light' | 'medium' | 'heavy';
+    grain: string;
+  };
   oauth: {
     autoLaunch: boolean;
     autoRegister: boolean;
@@ -329,6 +360,37 @@ export const defaults = Object.freeze<SystemConfig>({
     faces: {
       import: false,
     },
+  },
+  miniFilm: {
+    enabled: false,
+    binaryPath: 'mini-film',
+    workRoot: '/data/mini-film',
+    profilesRoot: '',
+    haldDir: '/data/mini-film/hald',
+    lcpRoot: '',
+    rawtherapeePath: 'rawtherapee-cli',
+    convertPath: 'convert',
+    allowedProfiles: [],
+    defaultProfiles: [],
+    maxJobs: 4,
+    defaultJobs: 2,
+    reviewPortStart: 9090,
+    reviewPortEnd: 9190,
+    outputFormat: 'jpg',
+    jpgQuality: 95,
+    jpegSubsampling: 's444',
+    progressive: true,
+    stripMetadata: false,
+    longEdge: 0,
+    gallery: 'modern',
+    galleryThumbnailLongEdge: 1024,
+    galleryColumns: 4,
+    publishAlbum: 'published',
+    noGrain: false,
+    colorNoiseIsoThreshold: 1600,
+    lensCorrections: '',
+    grainPreset: '',
+    grain: '',
   },
   oauth: {
     autoLaunch: false,

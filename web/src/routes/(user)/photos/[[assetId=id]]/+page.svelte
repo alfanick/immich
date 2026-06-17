@@ -128,6 +128,8 @@
 
       <ButtonContextMenu icon={mdiDotsVertical} title={$t('menu')}>
         <DownloadAction menuItem />
+        <ActionMenuItem action={Actions.MiniFilmReview} />
+        <ActionMenuItem action={Actions.MiniFilmApply} />
         {#if assetMultiSelectManager.assets.length > 1 || isAssetStackSelected}
           <StackAction
             unstack={isAssetStackSelected}

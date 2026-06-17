@@ -1,0 +1,1171 @@
+import {
+  BadRequestException,
+  ForbiddenException,
+  Injectable,
+  InternalServerErrorException,
+  NotFoundException,
+} from '@nestjs/common';
+import { spawn, type ChildProcess } from 'node:child_process';
+import fs from 'node:fs/promises';
+import net from 'node:net';
+import path from 'node:path';
+import sanitize from 'sanitize-filename';
+import { SystemConfig } from 'src/config';
+import { Asset } from 'src/database';
+import { AuthDto } from 'src/dtos/auth.dto';
+import {
+  MiniFilmApplyJobCreateDto,
+  MiniFilmApplyJobResponseDto,
+  MiniFilmImportResponseDto,
+  MiniFilmProfileLeafDto,
+  MiniFilmProfileNodeDto,
+  MiniFilmProfileTreeDto,
+  MiniFilmReviewSessionCreateDto,
+  MiniFilmReviewSessionImportDto,
+  MiniFilmReviewSessionResponseDto,
+} from 'src/dtos/mini-film.dto';
+import { AlbumUserRole, AssetType, Permission, SystemMetadataKey } from 'src/enum';
+import { AlbumService } from 'src/services/album.service';
+import { AssetMediaService } from 'src/services/asset-media.service';
+import { BaseService } from 'src/services/base.service';
+import { mimeTypes } from 'src/utils/mime-types';
+
+type MiniFilmConfig = SystemConfig['miniFilm'];
+type MiniFilmStatus = 'starting' | 'running' | 'stopped' | 'failed' | 'imported';
+type MiniFilmApplyStatus = 'queued' | 'running' | 'completed' | 'failed';
+
+type MiniFilmSkippedAsset = {
+  id: string;
+  originalFileName: string;
+  reason: string;
+};
+
+type StoredReviewSession = {
+  id: string;
+  userId: string;
+  name: string;
+  status: MiniFilmStatus;
+  reviewUrl: string;
+  reviewPort: number;
+  inputDir: string;
+  outputDir: string;
+  statePath: string;
+  publishAlbum: string;
+  assetIds: string[];
+  skippedAssets: MiniFilmSkippedAsset[];
+  profiles: string[];
+  createdAt: string;
+  updatedAt: string;
+  command: string[];
+  logs: string;
+  exitCode?: number | null;
+  signal?: string | null;
+  importedAlbumId?: string;
+  importedAssetIds?: string[];
+};
+
+type StoredApplyJob = {
+  id: string;
+  userId: string;
+  status: MiniFilmApplyStatus;
+  outputDir: string;
+  assetIds: string[];
+  rawAssetIds: string[];
+  skippedAssets: MiniFilmSkippedAsset[];
+  profiles: string[];
+  createdAt: string;
+  updatedAt: string;
+  processed: number;
+  total: number;
+  logs: string;
+  error?: string;
+  albumName: string;
+  albumId?: string;
+  importedAssetIds?: string[];
+};
+
+type MiniFilmState = {
+  reviewSessions: Record<string, StoredReviewSession>;
+  applyJobs: Record<string, StoredApplyJob>;
+};
+
+type MiniFilmCommonOptions = Partial<MiniFilmConfig> & {
+  profiles?: string[];
+  jobs?: number;
+  albumName?: string;
+};
+
+type ProfileNodeMutable = {
+  profiles: MiniFilmProfileLeafDto[];
+  children: Map<string, ProfileNodeMutable>;
+};
+
+const MAX_LOG_LENGTH = 64 * 1024;
+
+@Injectable()
+export class MiniFilmService extends BaseService {
+  private reviewProcesses = new Map<string, ChildProcess>();
+
+  async getProfileTree(auth: AuthDto, includeAll = false): Promise<MiniFilmProfileTreeDto> {
+    if (includeAll && !auth.user.isAdmin) {
+      throw new ForbiddenException();
+    }
+    const systemConfig = await this.getConfig({ withCache: false });
+    const config = systemConfig.miniFilm;
+    return this.buildProfileTree(config, includeAll);
+  }
+
+  async createReviewSession(
+    auth: AuthDto,
+    dto: MiniFilmReviewSessionCreateDto,
+  ): Promise<MiniFilmReviewSessionResponseDto> {
+    const config = await this.requireEnabled();
+    const profiles = await this.resolveProfiles(config, dto.profiles);
+    const { assets, skippedAssets, name } = await this.resolveReviewAssets(auth, dto);
+    if (assets.length === 0) {
+      throw new BadRequestException('No supported image assets selected for mini-film review');
+    }
+
+    const id = this.cryptoRepository.randomUUID();
+    const createdAt = new Date().toISOString();
+    const root = path.join(path.resolve(config.workRoot), auth.user.id, id);
+    const inputDir = path.join(root, 'input');
+    const outputDir = path.join(root, 'output');
+    const statePath = path.join(outputDir, 'mini-film-review.json');
+    const publishAlbum = this.publishAlbumName(dto.publishAlbum ?? config.publishAlbum);
+    const reviewPort = await this.allocatePort(config.reviewPortStart, config.reviewPortEnd);
+    const reviewUrl = `/api/mini-film/review-sessions/${id}/review/`;
+
+    await fs.mkdir(inputDir, { recursive: true });
+    await fs.mkdir(outputDir, { recursive: true });
+    await this.symlinkInputs(inputDir, assets);
+
+    const args = [
+      'daemon',
+      inputDir,
+      outputDir,
+      ...this.profileArgs(profiles),
+      ...this.daemonArgs(config, dto),
+      '--publish-album',
+      publishAlbum,
+      '--review-address',
+      `127.0.0.1:${reviewPort}`,
+    ];
+    const session: StoredReviewSession = {
+      id,
+      userId: auth.user.id,
+      name: dto.name || dto.albumName || name || `mini-film review ${createdAt}`,
+      status: 'running',
+      reviewUrl,
+      reviewPort,
+      inputDir,
+      outputDir,
+      statePath,
+      publishAlbum,
+      assetIds: assets.map((asset) => asset.id),
+      skippedAssets,
+      profiles,
+      createdAt,
+      updatedAt: createdAt,
+      command: [config.binaryPath, ...args],
+      logs: '',
+    };
+
+    await this.updateState((state) => {
+      state.reviewSessions[id] = session;
+    });
+
+    const child = spawn(config.binaryPath, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    this.reviewProcesses.set(id, child);
+    child.stdout.on('data', (chunk) => void this.appendReviewLog(id, chunk.toString()));
+    child.stderr.on('data', (chunk) => void this.appendReviewLog(id, chunk.toString()));
+    child.on('error', (error) => void this.markReviewFailed(id, error));
+    child.on('exit', (code, signal) => void this.markReviewExited(id, code, signal));
+
+    return this.getReviewSession(auth, id);
+  }
+
+  async listReviewSessions(auth: AuthDto): Promise<MiniFilmReviewSessionResponseDto[]> {
+    const state = await this.getState();
+    return Object.values(state.reviewSessions)
+      .filter((session) => this.canSee(auth, session.userId))
+      .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+  }
+
+  async getReviewSession(auth: AuthDto, id: string): Promise<MiniFilmReviewSessionResponseDto> {
+    const session = await this.findReviewSession(id);
+    this.assertCanSee(auth, session.userId);
+    return session;
+  }
+
+  async stopReviewSession(auth: AuthDto, id: string): Promise<void> {
+    const session = await this.findReviewSession(id);
+    this.assertCanSee(auth, session.userId);
+    this.stopReviewProcess(id);
+    await this.patchReviewSession(id, (current) => ({
+      ...current,
+      status: current.status === 'imported' ? current.status : 'stopped',
+      updatedAt: new Date().toISOString(),
+    }));
+  }
+
+  async deleteReviewSession(auth: AuthDto, id: string): Promise<void> {
+    const session = await this.findReviewSession(id);
+    this.assertCanSee(auth, session.userId);
+    this.stopReviewProcess(id);
+    await this.updateState((state) => {
+      delete state.reviewSessions[id];
+    });
+  }
+
+  async importReviewSession(
+    auth: AuthDto,
+    id: string,
+    dto: MiniFilmReviewSessionImportDto,
+  ): Promise<MiniFilmImportResponseDto> {
+    const config = await this.requireEnabled();
+    const session = await this.findReviewSession(id);
+    this.assertCanSee(auth, session.userId);
+
+    const publishAlbum = this.publishAlbumName(dto.publishAlbum ?? session.publishAlbum ?? config.publishAlbum);
+    await this.runReviewPublish(session, config, publishAlbum, dto);
+
+    const publishDir = this.resolveInside(session.outputDir, publishAlbum);
+    const files = await this.collectImportableImages(publishDir);
+    if (files.length === 0) {
+      throw new BadRequestException(`No mini-film outputs found in ${publishDir}`);
+    }
+
+    const importedAssetIds = await this.importGeneratedFiles(auth, files);
+    if (importedAssetIds.length === 0) {
+      throw new BadRequestException(`No mini-film outputs were imported from ${publishDir}`);
+    }
+
+    const albumName = dto.albumName || session.name;
+    const album = await BaseService.create(AlbumService, this).create(auth, {
+      albumName,
+      assetIds: importedAssetIds,
+      albumUsers: [{ userId: auth.user.id, role: AlbumUserRole.Owner }],
+    });
+
+    await this.patchReviewSession(id, (current) => ({
+      ...current,
+      status: 'imported',
+      importedAlbumId: album.id,
+      importedAssetIds,
+      updatedAt: new Date().toISOString(),
+    }));
+    this.stopReviewProcess(id);
+
+    const updated = await this.getReviewSession(auth, id);
+    return {
+      albumId: album.id,
+      assetIds: importedAssetIds,
+      imported: importedAssetIds.length,
+      session: updated,
+    };
+  }
+
+  async getReviewProxyTarget(auth: AuthDto, id: string): Promise<{ port: number }> {
+    const session = await this.findReviewSession(id);
+    this.assertCanSee(auth, session.userId);
+    if (session.status !== 'running') {
+      throw new BadRequestException(this.reviewUnavailableMessage(session));
+    }
+    if (!this.reviewProcesses.has(id)) {
+      await this.patchReviewSession(id, (current) => ({
+        ...current,
+        status: 'failed',
+        logs: this.limitLog(`${current.logs}\nmini-film review daemon is not running in this Immich server process\n`),
+        updatedAt: new Date().toISOString(),
+      }));
+      throw new BadRequestException('mini-film review daemon is not running; start a new review session');
+    }
+    return { port: session.reviewPort };
+  }
+
+  async createApplyJob(auth: AuthDto, dto: MiniFilmApplyJobCreateDto): Promise<MiniFilmApplyJobResponseDto> {
+    const config = await this.requireEnabled();
+    await this.requireAccess({ auth, permission: Permission.AssetDownload, ids: dto.assetIds });
+    const allAssets = await this.getAssetsInInputOrder(dto.assetIds);
+    const rawAssets = allAssets.filter((asset) => mimeTypes.isRaw(asset.originalPath || asset.originalFileName));
+    const skippedAssets = allAssets
+      .filter((asset) => !mimeTypes.isRaw(asset.originalPath || asset.originalFileName))
+      .map((asset) => ({
+        id: asset.id,
+        originalFileName: asset.originalFileName,
+        reason: this.applySkipReason(asset),
+      }));
+
+    if (rawAssets.length === 0) {
+      throw new BadRequestException('mini-film apply only runs on RAW assets; JPEG/HEIC and movies are skipped');
+    }
+
+    const profiles = await this.resolveProfiles(config, dto.profiles);
+    const id = this.cryptoRepository.randomUUID();
+    const createdAt = new Date().toISOString();
+    const outputDir = path.join(path.resolve(config.workRoot), auth.user.id, id, 'apply-output');
+    await fs.mkdir(outputDir, { recursive: true });
+
+    const total = rawAssets.length * Math.max(profiles.length, 1);
+    const job: StoredApplyJob = {
+      id,
+      userId: auth.user.id,
+      status: 'queued',
+      outputDir,
+      assetIds: allAssets.map((asset) => asset.id),
+      rawAssetIds: rawAssets.map((asset) => asset.id),
+      skippedAssets,
+      profiles,
+      createdAt,
+      updatedAt: createdAt,
+      processed: 0,
+      total,
+      logs: '',
+      albumName: dto.albumName || `mini-film apply ${createdAt}`,
+    };
+
+    await this.updateState((state) => {
+      state.applyJobs[id] = job;
+    });
+    void this.runApplyJob(auth, id, config, dto, rawAssets, profiles);
+
+    return this.getApplyJob(auth, id);
+  }
+
+  async listApplyJobs(auth: AuthDto): Promise<MiniFilmApplyJobResponseDto[]> {
+    const state = await this.getState();
+    return Object.values(state.applyJobs)
+      .filter((job) => this.canSee(auth, job.userId))
+      .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+  }
+
+  async getApplyJob(auth: AuthDto, id: string): Promise<MiniFilmApplyJobResponseDto> {
+    const job = await this.findApplyJob(id);
+    this.assertCanSee(auth, job.userId);
+    return job;
+  }
+
+  private async requireEnabled(): Promise<MiniFilmConfig> {
+    const systemConfig = await this.getConfig({ withCache: false });
+    const config = systemConfig.miniFilm;
+    if (!config.enabled) {
+      throw new BadRequestException('mini-film is disabled');
+    }
+    if (!config.binaryPath.trim()) {
+      throw new BadRequestException('mini-film binary path is not configured');
+    }
+    if (!config.workRoot.trim()) {
+      throw new BadRequestException('mini-film work root is not configured');
+    }
+    return config;
+  }
+
+  private async resolveReviewAssets(
+    auth: AuthDto,
+    dto: MiniFilmReviewSessionCreateDto,
+  ): Promise<{ assets: Asset[]; skippedAssets: MiniFilmSkippedAsset[]; name?: string }> {
+    let assets: Asset[];
+    let name: string | undefined;
+    if (dto.albumId) {
+      await this.requireAccess({ auth, permission: Permission.AlbumRead, ids: [dto.albumId] });
+      const album = await this.albumRepository.getById(dto.albumId, { withAssets: true }, auth.user.id);
+      if (!album) {
+        throw new NotFoundException('Album not found');
+      }
+      assets = (album.assets || []) as unknown as Asset[];
+      name = album.albumName;
+      if (assets.length > 0) {
+        await this.requireAccess({ auth, permission: Permission.AssetDownload, ids: assets.map((asset) => asset.id) });
+      }
+    } else {
+      const assetIds = dto.assetIds || [];
+      await this.requireAccess({ auth, permission: Permission.AssetDownload, ids: assetIds });
+      assets = await this.getAssetsInInputOrder(assetIds);
+    }
+
+    const supported = assets.filter((asset) => mimeTypes.isImage(asset.originalPath || asset.originalFileName));
+    const skippedAssets = assets
+      .filter((asset) => !mimeTypes.isImage(asset.originalPath || asset.originalFileName))
+      .map((asset) => ({
+        id: asset.id,
+        originalFileName: asset.originalFileName,
+        reason: mimeTypes.isVideo(asset.originalPath || asset.originalFileName) ? 'video skipped' : 'unsupported asset',
+      }));
+    return { assets: supported, skippedAssets, name };
+  }
+
+  private async getAssetsInInputOrder(assetIds: string[]): Promise<Asset[]> {
+    const assets = await this.assetRepository.getByIds(assetIds);
+    const assetById = new Map(assets.map((asset) => [asset.id, asset as Asset]));
+    return assetIds.map((id) => assetById.get(id)).filter((asset): asset is Asset => asset !== undefined);
+  }
+
+  private async symlinkInputs(inputDir: string, assets: Asset[]) {
+    for (const asset of assets) {
+      const originalPath = path.resolve(asset.originalPath);
+      const relative = originalPath.replace(/^[/\\]+/, '');
+      const linkPath = path.join(inputDir, relative);
+      await fs.mkdir(path.dirname(linkPath), { recursive: true });
+      try {
+        await fs.symlink(originalPath, linkPath);
+      } catch (error: any) {
+        if (error?.code !== 'EEXIST') {
+          throw error;
+        }
+      }
+    }
+  }
+
+  private async runApplyJob(
+    auth: AuthDto,
+    id: string,
+    config: MiniFilmConfig,
+    dto: MiniFilmApplyJobCreateDto,
+    rawAssets: Asset[],
+    profiles: string[],
+  ) {
+    try {
+      await this.patchApplyJob(id, (job) => ({ ...job, status: 'running', updatedAt: new Date().toISOString() }));
+      const job = await this.findApplyJob(id);
+      const outputFiles: string[] = [];
+      const selectedProfiles = profiles.length > 0 ? profiles : [undefined];
+
+      for (const asset of rawAssets) {
+        for (const [profileIndex, profile] of selectedProfiles.entries()) {
+          const output = this.applyOutputPath(job.outputDir, asset, profile, profileIndex, config, dto);
+          const args = ['apply', asset.originalPath, '--output', output, ...this.applyArgs(config, dto, profile)];
+          await this.runProcess(config.binaryPath, args, (text) => void this.appendApplyLog(id, text));
+          outputFiles.push(output);
+          await this.patchApplyJob(id, (current) => ({
+            ...current,
+            processed: current.processed + 1,
+            updatedAt: new Date().toISOString(),
+          }));
+        }
+      }
+
+      const importedAssetIds = await this.importGeneratedFiles(auth, outputFiles);
+      const album = await BaseService.create(AlbumService, this).create(auth, {
+        albumName: job.albumName,
+        assetIds: importedAssetIds,
+        albumUsers: [{ userId: auth.user.id, role: AlbumUserRole.Owner }],
+      });
+
+      await this.patchApplyJob(id, (current) => ({
+        ...current,
+        status: 'completed',
+        albumId: album.id,
+        importedAssetIds,
+        updatedAt: new Date().toISOString(),
+      }));
+    } catch (error: any) {
+      await this.appendApplyLog(id, `${error?.message || error}\n`);
+      await this.patchApplyJob(id, (job) => ({
+        ...job,
+        status: 'failed',
+        error: error?.message || String(error),
+        updatedAt: new Date().toISOString(),
+      }));
+    }
+  }
+
+  private async runReviewPublish(
+    session: StoredReviewSession,
+    config: MiniFilmConfig,
+    publishAlbum: string,
+    dto: MiniFilmReviewSessionImportDto,
+  ) {
+    if (!(await this.fileExists(session.statePath))) {
+      throw new BadRequestException(`mini-film review state is not ready at ${session.statePath}`);
+    }
+
+    const args = [
+      'review-publish',
+      '--state',
+      session.statePath,
+      '--input-root',
+      session.inputDir,
+      '--output-root',
+      session.outputDir,
+      '--album',
+      publishAlbum,
+      '--min-rating',
+      String(dto.minRating ?? 0),
+      ...this.publishArgs(config, dto),
+    ];
+
+    for (const label of dto.labels || []) {
+      args.push('--label', label);
+    }
+    for (const tag of dto.tags || []) {
+      args.push('--tag', tag);
+    }
+    if (dto.rerenderRaw) {
+      args.push('--rerender-raw');
+    }
+
+    await this.runProcess(config.binaryPath, args, (text) => void this.appendReviewLog(session.id, text));
+  }
+
+  private async importGeneratedFiles(auth: AuthDto, files: string[]): Promise<string[]> {
+    const assetService = BaseService.create(AssetMediaService, this);
+    const assetIds: string[] = [];
+    for (const file of files) {
+      const result = await assetService.importLocalAsset(auth, file, path.basename(file));
+      if (result.id) {
+        assetIds.push(result.id);
+      }
+    }
+    return assetIds;
+  }
+
+  private applyOutputPath(
+    outputDir: string,
+    asset: Asset,
+    profile: string | undefined,
+    profileIndex: number,
+    config: MiniFilmConfig,
+    dto: MiniFilmApplyJobCreateDto,
+  ) {
+    const extension = (dto.outputFormat ?? config.outputFormat) === 'tiff' ? 'tif' : 'jpg';
+    const stem = path.parse(asset.originalFileName).name || path.parse(asset.originalPath).name || asset.id;
+    const profileStem = profile ? path.parse(profile).name || 'profile' : 'default';
+    const filename = sanitize(
+      `${stem}__${String(profileIndex + 1).padStart(2, '0')}__${profileStem}__${asset.id.slice(0, 8)}.${extension}`,
+    );
+    return path.join(outputDir, filename);
+  }
+
+  private async collectImportableImages(root: string): Promise<string[]> {
+    const entries = await fs.readdir(root, { withFileTypes: true }).catch((error: any) => {
+      if (error?.code === 'ENOENT') {
+        return [];
+      }
+      throw error;
+    });
+    const files: string[] = [];
+    for (const entry of entries) {
+      const fullPath = path.join(root, entry.name);
+      if (entry.isDirectory()) {
+        if (entry.name === '.mini-film-gallery-thumbnails') {
+          continue;
+        }
+        files.push(...(await this.collectImportableImages(fullPath)));
+      } else if (entry.isFile() && mimeTypes.isImage(fullPath)) {
+        files.push(fullPath);
+      }
+    }
+    return files.sort();
+  }
+
+  private daemonArgs(config: MiniFilmConfig, options: MiniFilmCommonOptions): string[] {
+    return [
+      ...this.sharedMiniFilmArgs(config, options, {
+        jobs: true,
+        outputFormat: true,
+        gallery: true,
+        progressive: 'daemon',
+      }),
+    ];
+  }
+
+  private publishArgs(config: MiniFilmConfig, options: MiniFilmCommonOptions): string[] {
+    return [
+      ...this.sharedMiniFilmArgs(config, options, {
+        jobs: true,
+        outputFormat: true,
+        gallery: true,
+        progressive: 'daemon',
+      }),
+    ];
+  }
+
+  private applyArgs(config: MiniFilmConfig, options: MiniFilmCommonOptions, profile: string | undefined): string[] {
+    return [
+      ...(profile ? ['--profile', profile] : []),
+      ...this.sharedMiniFilmArgs(config, options, {
+        jobs: false,
+        outputFormat: false,
+        gallery: false,
+        progressive: 'apply',
+      }),
+    ];
+  }
+
+  private sharedMiniFilmArgs(
+    config: MiniFilmConfig,
+    options: MiniFilmCommonOptions,
+    flags: { jobs: boolean; outputFormat: boolean; gallery: boolean; progressive: 'daemon' | 'apply' },
+  ): string[] {
+    const args: string[] = [];
+    this.pushOptional(args, '--profiles-root', this.effectiveProfilesRoot(config));
+    this.pushOptional(args, '--hald-dir', options.haldDir?.trim() || this.effectiveHaldDir(config));
+    this.pushOptional(args, '--lcp-root', options.lcpRoot ?? config.lcpRoot);
+    this.pushOptional(args, '--rawtherapee', options.rawtherapeePath ?? config.rawtherapeePath);
+    this.pushOptional(args, '--convert', options.convertPath ?? config.convertPath);
+    this.pushOptional(
+      args,
+      '--color-noise-iso-threshold',
+      String(options.colorNoiseIsoThreshold ?? config.colorNoiseIsoThreshold),
+    );
+    this.pushOptional(args, '--jpg-quality', String(options.jpgQuality ?? config.jpgQuality));
+    this.pushOptional(args, '--jpeg-subsampling', options.jpegSubsampling ?? config.jpegSubsampling);
+
+    const longEdge = options.longEdge ?? config.longEdge;
+    if (longEdge > 0) {
+      args.push('--long-edge', String(longEdge));
+    }
+
+    const lensCorrections = (options.lensCorrections ?? config.lensCorrections).trim();
+    if (lensCorrections) {
+      args.push(`--lens-corrections=${lensCorrections}`);
+    }
+    const grainPreset = options.grainPreset ?? config.grainPreset;
+    if (grainPreset) {
+      args.push('--grain-preset', grainPreset);
+    }
+    const grain = (options.grain ?? config.grain).trim();
+    if (grain) {
+      args.push('--grain', grain);
+    }
+    if (options.noGrain ?? config.noGrain) {
+      args.push('--no-grain');
+    }
+    if (options.stripMetadata ?? config.stripMetadata) {
+      args.push('--strip-metadata');
+    }
+    if (options.progressive ?? config.progressive) {
+      args.push(flags.progressive === 'apply' ? '--progressive-jpeg' : '--progressive');
+    }
+
+    if (flags.outputFormat) {
+      args.push('--output-format', options.outputFormat ?? config.outputFormat);
+    }
+    if (flags.jobs) {
+      args.push('--jobs', String(this.resolveJobs(config, options.jobs)));
+    }
+    if (flags.gallery) {
+      const gallery = options.gallery ?? config.gallery;
+      if (gallery) {
+        args.push('--gallery', gallery);
+      }
+      args.push(
+        '--gallery-thumbnail-long-edge',
+        String(options.galleryThumbnailLongEdge ?? config.galleryThumbnailLongEdge),
+        '--gallery-columns',
+        String(options.galleryColumns ?? config.galleryColumns),
+      );
+    }
+
+    return args;
+  }
+
+  private profileArgs(profiles: string[]): string[] {
+    return profiles.flatMap((profile) => ['--profile', profile]);
+  }
+
+  private resolveJobs(config: MiniFilmConfig, requested: number | undefined): number {
+    const jobs = requested ?? config.defaultJobs;
+    if (jobs > config.maxJobs) {
+      throw new BadRequestException(`mini-film jobs cannot exceed ${config.maxJobs}`);
+    }
+    return jobs;
+  }
+
+  private pushOptional(args: string[], flag: string, value: string | undefined) {
+    if (value?.trim()) {
+      args.push(flag, value);
+    }
+  }
+
+  private async resolveProfiles(config: MiniFilmConfig, selectedProfiles: string[] | undefined): Promise<string[]> {
+    const selectors = selectedProfiles?.length ? selectedProfiles : config.defaultProfiles;
+    if (selectors.length === 0) {
+      return [];
+    }
+
+    const leaves = await this.collectProfileLeaves(config);
+    const bySelector = new Map<string, MiniFilmProfileLeafDto>();
+    for (const leaf of leaves) {
+      bySelector.set(leaf.path, leaf);
+      bySelector.set(path.resolve(leaf.path), leaf);
+      bySelector.set(leaf.relative, leaf);
+      bySelector.set(leaf.name, leaf);
+    }
+
+    const allowedProfiles = new Set<string>();
+    for (const selector of config.allowedProfiles) {
+      const leaf = bySelector.get(selector) || bySelector.get(path.resolve(selector));
+      allowedProfiles.add(leaf?.path ?? selector);
+    }
+
+    return Promise.all(
+      selectors.map(async (selector) => {
+        const leaf = bySelector.get(selector) || bySelector.get(path.resolve(selector));
+        const resolved = leaf?.path ?? selector;
+        if (allowedProfiles.size > 0 && !allowedProfiles.has(resolved)) {
+          throw new BadRequestException(`mini-film profile is not allowed: ${selector}`);
+        }
+        if (!leaf && path.isAbsolute(resolved) && !(await this.fileExists(resolved))) {
+          throw new BadRequestException(`mini-film profile does not exist: ${selector}`);
+        }
+        return resolved;
+      }),
+    );
+  }
+
+  private async buildProfileTree(config: MiniFilmConfig, includeAll = false): Promise<MiniFilmProfileTreeDto> {
+    const root = await this.resolveEmulationRoot(config);
+    if (!root) {
+      return { root: '', count: 0, children: [] };
+    }
+    const leaves = await this.collectProfileLeaves(config);
+    const allowed = new Set(config.allowedProfiles);
+    const tree: ProfileNodeMutable = { profiles: [], children: new Map() };
+
+    for (const leaf of leaves) {
+      if (
+        !includeAll &&
+        allowed.size > 0 &&
+        !allowed.has(leaf.path) &&
+        !allowed.has(leaf.relative) &&
+        !allowed.has(leaf.name)
+      ) {
+        continue;
+      }
+      this.insertProfile(tree, this.profileNameParts(leaf.name), leaf);
+    }
+
+    const children = this.childrenIntoNodes(tree.children);
+    return { root, count: this.countLeaves(children), children };
+  }
+
+  private async collectProfileLeaves(config: MiniFilmConfig): Promise<MiniFilmProfileLeafDto[]> {
+    const root = await this.resolveEmulationRoot(config);
+    if (!root) {
+      return [];
+    }
+    const files = await this.collectXmpProfiles(root);
+    return files.map((file) => {
+      const relative = path.relative(root, file);
+      const name = this.profileDisplayNameFromRelative(relative);
+      return { name, path: file, relative };
+    });
+  }
+
+  private effectiveProfilesRoot(config: MiniFilmConfig): string {
+    return (config.profilesRoot || process.env.MINI_FILM_PROFILES_ROOT || '').trim();
+  }
+
+  private effectiveHaldDir(config: MiniFilmConfig): string {
+    return config.haldDir.trim() || path.join(path.resolve(config.workRoot), 'hald');
+  }
+
+  private reviewUnavailableMessage(session: StoredReviewSession): string {
+    const details = session.logs.trim().split('\n').filter(Boolean).slice(-4).join('\n');
+    return details
+      ? `mini-film review session is ${session.status}: ${details}`
+      : `mini-film review session is ${session.status}`;
+  }
+
+  private async resolveEmulationRoot(config: MiniFilmConfig): Promise<string> {
+    const rawRoot = this.effectiveProfilesRoot(config);
+    if (!rawRoot) {
+      return '';
+    }
+    const root = path.resolve(rawRoot);
+    const direct = path.join(root, 'emulations');
+    if (await this.isDirectory(direct)) {
+      return direct;
+    }
+    if (path.basename(root).toLowerCase() === 'emulations' && (await this.isDirectory(root))) {
+      return root;
+    }
+    try {
+      const canonical = await fs.realpath(root);
+      const sibling = path.join(path.dirname(canonical), 'emulations');
+      if (await this.isDirectory(sibling)) {
+        return sibling;
+      }
+    } catch {
+      // Fall through and let the scanner return an empty tree.
+    }
+    return (await this.isDirectory(root)) ? root : '';
+  }
+
+  private async collectXmpProfiles(root: string): Promise<string[]> {
+    const profiles: string[] = [];
+    const visited = new Set<string>();
+    const walk = async (directory: string) => {
+      let realDirectory: string;
+      try {
+        realDirectory = await fs.realpath(directory);
+      } catch {
+        return;
+      }
+      if (visited.has(realDirectory)) {
+        return;
+      }
+      visited.add(realDirectory);
+
+      const entries = await fs.readdir(directory, { withFileTypes: true }).catch(() => []);
+      for (const entry of entries) {
+        const fullPath = path.join(directory, entry.name);
+        const stat = await fs.stat(fullPath).catch(() => null);
+        if (!stat) {
+          continue;
+        }
+        if (stat.isDirectory()) {
+          await walk(fullPath);
+        } else if (stat.isFile() && path.extname(entry.name).toLowerCase() === '.xmp') {
+          profiles.push(fullPath);
+        }
+      }
+    };
+
+    await walk(root);
+    return profiles.sort();
+  }
+
+  private insertProfile(node: ProfileNodeMutable, parts: string[], profile: MiniFilmProfileLeafDto) {
+    const [part, ...rest] = parts;
+    if (!part) {
+      node.profiles.push(profile);
+      return;
+    }
+    let child = node.children.get(part);
+    if (!child) {
+      child = { profiles: [], children: new Map() };
+      node.children.set(part, child);
+    }
+    this.insertProfile(child, rest, profile);
+  }
+
+  private childrenIntoNodes(children: Map<string, ProfileNodeMutable>): MiniFilmProfileNodeDto[] {
+    return [...children.entries()]
+      .sort(([left], [right]) => this.compareProfilePart(left, right))
+      .map(([label, child]) => ({
+        label,
+        profiles: child.profiles,
+        children: this.childrenIntoNodes(child.children),
+      }));
+  }
+
+  private countLeaves(nodes: MiniFilmProfileNodeDto[]): number {
+    return nodes.reduce((count, node) => count + node.profiles.length + this.countLeaves(node.children), 0);
+  }
+
+  private profileDisplayNameFromRelative(relative: string): string {
+    return (path.parse(relative).name || relative).trim();
+  }
+
+  private profileNameParts(name: string): string[] {
+    const parts = name
+      .replaceAll(/[_\-/.]/g, ' ')
+      .split(/\s+/)
+      .map((part) => part.trim())
+      .filter(Boolean);
+    return parts.length > 0 ? parts : ['Profile'];
+  }
+
+  private compareProfilePart(left: string, right: string): number {
+    if (left < right) {
+      return -1;
+    }
+    if (left > right) {
+      return 1;
+    }
+    return 0;
+  }
+
+  private variantSortKey(label: string): string {
+    const parts = this.profileNameParts(label);
+    const markerParts: string[] = [];
+    const nonGrainyMarkers: string[] = [];
+    for (const part of parts) {
+      const marker = this.normalizeVariantMarker(part);
+      if (marker) {
+        markerParts.push(marker);
+        if (marker !== 'grainy') {
+          nonGrainyMarkers.push(marker);
+        }
+      }
+    }
+
+    let variantGroup = 0;
+    let variantMarkersKey = '';
+    let grainyPosition = 0;
+    if (nonGrainyMarkers.length === 0) {
+      if (markerParts.length > 0) {
+        variantGroup = 1;
+        variantMarkersKey = 'grainy';
+        grainyPosition = 1;
+      }
+    } else {
+      nonGrainyMarkers.sort((left, right) => this.variantMarkerRank(left) - this.variantMarkerRank(right));
+      variantGroup = Math.min(this.variantMarkerRank(nonGrainyMarkers[0]), 999);
+      variantMarkersKey = nonGrainyMarkers.join(' ');
+      grainyPosition = markerParts.includes('grainy') ? 1 : 0;
+    }
+
+    const normalized = parts
+      .filter((part) => !this.normalizeVariantMarker(part))
+      .map((part) => this.naturalSortPart(part))
+      .join(' ')
+      .toLowerCase();
+    return `${normalized}\0${String(variantGroup).padStart(3, '0')}\0${variantMarkersKey}\0${grainyPosition}\0${label.toLowerCase()}`;
+  }
+
+  private normalizeVariantMarker(part: string): string | undefined {
+    const normalized = part.replaceAll(/^\++|\++$/g, '').toLowerCase();
+    if (normalized.length === 0) {
+      return 'plus';
+    }
+    const known = new Set([
+      'grainy',
+      'plus',
+      'hc',
+      'faded',
+      'fade',
+      'warm',
+      'cool',
+      'vibrant',
+      'muted',
+      'contrast',
+      'contrasty',
+      'expired',
+    ]);
+    if (!known.has(normalized)) {
+      return;
+    }
+    return normalized === 'fade' ? 'faded' : normalized;
+  }
+
+  private variantMarkerRank(marker: string): number {
+    const ranks: Record<string, number> = {
+      grainy: 1,
+      faded: 2,
+      plus: 3,
+      hc: 4,
+      warm: 5,
+      cool: 6,
+      vibrant: 7,
+      muted: 8,
+      contrast: 9,
+      contrasty: 10,
+      expired: 11,
+    };
+    return ranks[marker] ?? 98;
+  }
+
+  private naturalSortPart(part: string): string {
+    const version = /^v(\d+)$/i.exec(part)?.[1];
+    if (version) {
+      return `v${String(Number(version)).padStart(6, '0')}`;
+    }
+    if (/^\d+$/.test(part)) {
+      return String(Number(part)).padStart(6, '0');
+    }
+    return part;
+  }
+
+  private async allocatePort(start: number, end: number): Promise<number> {
+    for (let port = start; port <= end; port++) {
+      if (await this.canListen(port)) {
+        return port;
+      }
+    }
+    throw new BadRequestException(`No free mini-film review ports in ${start}-${end}`);
+  }
+
+  private canListen(port: number): Promise<boolean> {
+    return new Promise((resolve) => {
+      const server = net.createServer();
+      server.once('error', () => resolve(false));
+      server.once('listening', () => {
+        server.close(() => resolve(true));
+      });
+      server.listen(port, '127.0.0.1');
+    });
+  }
+
+  private runProcess(binary: string, args: string[], onOutput: (text: string) => void): Promise<void> {
+    return new Promise((resolve, reject) => {
+      onOutput(`$ ${[binary, ...args].join(' ')}\n`);
+      const child = spawn(binary, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+      child.stdout.on('data', (chunk) => onOutput(chunk.toString()));
+      child.stderr.on('data', (chunk) => onOutput(chunk.toString()));
+      child.on('error', (error) => reject(error));
+      child.on('exit', (code, signal) => {
+        if (code === 0) {
+          resolve();
+        } else {
+          reject(
+            new InternalServerErrorException(`mini-film exited with code ${code ?? 'null'} signal ${signal ?? 'null'}`),
+          );
+        }
+      });
+    });
+  }
+
+  private publishAlbumName(value: string): string {
+    const album = value.trim() || 'published';
+    if (path.isAbsolute(album) || album.split(/[\\/]+/).includes('..')) {
+      throw new BadRequestException('mini-film publish album must be a relative folder');
+    }
+    return album;
+  }
+
+  private resolveInside(root: string, relative: string): string {
+    const resolvedRoot = path.resolve(root);
+    const resolved = path.resolve(resolvedRoot, relative);
+    if (resolved !== resolvedRoot && !resolved.startsWith(`${resolvedRoot}${path.sep}`)) {
+      throw new BadRequestException('mini-film path escapes the session output folder');
+    }
+    return resolved;
+  }
+
+  private applySkipReason(asset: Asset): string {
+    if (asset.type === AssetType.Video || mimeTypes.isVideo(asset.originalPath || asset.originalFileName)) {
+      return 'video skipped';
+    }
+    if (mimeTypes.isImage(asset.originalPath || asset.originalFileName)) {
+      return 'apply only supports RAW assets';
+    }
+    return 'unsupported asset';
+  }
+
+  private canSee(auth: AuthDto, ownerId: string): boolean {
+    return auth.user.isAdmin || auth.user.id === ownerId;
+  }
+
+  private assertCanSee(auth: AuthDto, ownerId: string) {
+    if (!this.canSee(auth, ownerId)) {
+      throw new ForbiddenException();
+    }
+  }
+
+  private stopReviewProcess(id: string) {
+    const child = this.reviewProcesses.get(id);
+    if (!child) {
+      return;
+    }
+    this.reviewProcesses.delete(id);
+    if (!child.killed) {
+      child.kill('SIGTERM');
+    }
+  }
+
+  private async appendReviewLog(id: string, text: string) {
+    await this.patchReviewSession(id, (session) => ({
+      ...session,
+      logs: this.limitLog(`${session.logs}${text}`),
+      updatedAt: new Date().toISOString(),
+    }));
+  }
+
+  private async appendApplyLog(id: string, text: string) {
+    await this.patchApplyJob(id, (job) => ({
+      ...job,
+      logs: this.limitLog(`${job.logs}${text}`),
+      updatedAt: new Date().toISOString(),
+    }));
+  }
+
+  private limitLog(log: string): string {
+    return log.length > MAX_LOG_LENGTH ? log.slice(-MAX_LOG_LENGTH) : log;
+  }
+
+  private async markReviewFailed(id: string, error: Error) {
+    await this.patchReviewSession(id, (session) => ({
+      ...session,
+      status: 'failed',
+      logs: this.limitLog(`${session.logs}${error.message}\n`),
+      updatedAt: new Date().toISOString(),
+    }));
+  }
+
+  private async markReviewExited(id: string, code: number | null, signal: NodeJS.Signals | null) {
+    this.reviewProcesses.delete(id);
+    await this.patchReviewSession(id, (session) => {
+      if (session.status === 'imported') {
+        return { ...session, exitCode: code, signal, updatedAt: new Date().toISOString() };
+      }
+      return {
+        ...session,
+        status: code === 0 || signal === 'SIGTERM' ? 'stopped' : 'failed',
+        exitCode: code,
+        signal,
+        updatedAt: new Date().toISOString(),
+      };
+    });
+  }
+
+  private async findReviewSession(id: string): Promise<StoredReviewSession> {
+    const state = await this.getState();
+    const session = state.reviewSessions[id];
+    if (!session) {
+      throw new NotFoundException('mini-film review session not found');
+    }
+    return session;
+  }
+
+  private async findApplyJob(id: string): Promise<StoredApplyJob> {
+    const state = await this.getState();
+    const job = state.applyJobs[id];
+    if (!job) {
+      throw new NotFoundException('mini-film apply job not found');
+    }
+    return job;
+  }
+
+  private async patchReviewSession(
+    id: string,
+    patch: (session: StoredReviewSession) => StoredReviewSession,
+  ): Promise<void> {
+    await this.updateState((state) => {
+      const session = state.reviewSessions[id];
+      if (session) {
+        state.reviewSessions[id] = patch(session);
+      }
+    });
+  }
+
+  private async patchApplyJob(id: string, patch: (job: StoredApplyJob) => StoredApplyJob): Promise<void> {
+    await this.updateState((state) => {
+      const job = state.applyJobs[id];
+      if (job) {
+        state.applyJobs[id] = patch(job);
+      }
+    });
+  }
+
+  private async getState(): Promise<MiniFilmState> {
+    const state = (await this.systemMetadataRepository.get(SystemMetadataKey.MiniFilmState)) as MiniFilmState | null;
+    return {
+      reviewSessions: state?.reviewSessions ? { ...state.reviewSessions } : {},
+      applyJobs: state?.applyJobs ? { ...state.applyJobs } : {},
+    };
+  }
+
+  private async updateState(mutator: (state: MiniFilmState) => void): Promise<void> {
+    const state = await this.getState();
+    mutator(state);
+    await this.systemMetadataRepository.set(SystemMetadataKey.MiniFilmState, state as any);
+  }
+
+  private async isDirectory(value: string): Promise<boolean> {
+    return fs
+      .stat(value)
+      .then((stat) => stat.isDirectory())
+      .catch(() => false);
+  }
+
+  private async fileExists(value: string): Promise<boolean> {
+    return fs
+      .stat(value)
+      .then((stat) => stat.isFile())
+      .catch(() => false);
+  }
+}

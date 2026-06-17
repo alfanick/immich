@@ -12,12 +12,14 @@ import {
 import { modalManager, toastManager, type ActionItem } from '@immich/ui';
 import {
   mdiAlertOutline,
+  mdiAutoFix,
   mdiCogRefreshOutline,
   mdiContentCopy,
   mdiDatabaseRefreshOutline,
   mdiDownload,
   mdiDownloadBox,
   mdiFaceRecognition,
+  mdiFilmstrip,
   mdiHeadSyncOutline,
   mdiHeart,
   mdiHeartOutline,
@@ -40,6 +42,7 @@ import { authManager } from '$lib/managers/auth-manager.svelte';
 import { eventManager } from '$lib/managers/event-manager.svelte';
 import AssetAddToAlbumModal from '$lib/modals/AssetAddToAlbumModal.svelte';
 import AssetTagModal from '$lib/modals/AssetTagModal.svelte';
+import MiniFilmWorkflowModal from '$lib/modals/MiniFilmWorkflowModal.svelte';
 import SharedLinkCreateModal from '$lib/modals/SharedLinkCreateModal.svelte';
 import { getAssetMediaUrl, getSharedLink, sleep } from '$lib/utils';
 import { downloadUrl } from '$lib/utils';
@@ -87,7 +90,49 @@ export const getAssetBulkActions = ($t: MessageFormatter) => {
     $if: () => ownedAssets.every((asset) => asset.isVideo),
   };
 
-  return { AddToAlbum, RefreshFacesJob, RefreshMetadataJob, RegenerateThumbnailJob, TranscodeVideoJob };
+  const MiniFilmReview: ActionItem = {
+    title: 'mini-film review',
+    icon: mdiFilmstrip,
+    onAction: () =>
+      modalManager
+        .show(MiniFilmWorkflowModal, {
+          mode: 'review',
+          assetIds: assetMultiSelectManager.assets.map((asset) => asset.id),
+          defaultAlbumName: 'mini-film review',
+        })
+        .then((started) => {
+          if (started) {
+            assetMultiSelectManager.clear();
+          }
+        }),
+  };
+
+  const MiniFilmApply: ActionItem = {
+    title: 'mini-film apply',
+    icon: mdiAutoFix,
+    onAction: () =>
+      modalManager
+        .show(MiniFilmWorkflowModal, {
+          mode: 'apply',
+          assetIds: assetMultiSelectManager.assets.map((asset) => asset.id),
+          defaultAlbumName: 'mini-film apply',
+        })
+        .then((started) => {
+          if (started) {
+            assetMultiSelectManager.clear();
+          }
+        }),
+  };
+
+  return {
+    AddToAlbum,
+    MiniFilmReview,
+    MiniFilmApply,
+    RefreshFacesJob,
+    RefreshMetadataJob,
+    RegenerateThumbnailJob,
+    TranscodeVideoJob,
+  };
 };
 
 export const getAssetActions = ($t: MessageFormatter, asset: AssetResponseDto) => {

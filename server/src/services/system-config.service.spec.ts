@@ -103,6 +103,7 @@ const updatedConfig = Object.freeze<SystemConfig>({
       import: false,
     },
   },
+  miniFilm: defaults.miniFilm,
   machineLearning: {
     enabled: true,
     urls: ['http://immich-machine-learning:3003'],

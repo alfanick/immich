@@ -1,5 +1,5 @@
 import { BadRequestException, Injectable, InternalServerErrorException, NotFoundException } from '@nestjs/common';
-import { extname } from 'node:path';
+import { basename, extname, join } from 'node:path';
 import sanitize from 'sanitize-filename';
 import { StorageCore } from 'src/cores/storage.core';
 import { AuthSharedLink } from 'src/database';
@@ -44,6 +44,41 @@ export interface AssetMediaRedirectResponse {
 
 @Injectable()
 export class AssetMediaService extends BaseService {
+  async importLocalAsset(auth: AuthDto, sourcePath: string, originalName = basename(sourcePath)) {
+    const stat = await this.storageRepository.stat(sourcePath);
+    if (!stat.isFile()) {
+      throw new BadRequestException(`Cannot import non-file path ${sourcePath}`);
+    }
+
+    const file: UploadFile = {
+      uuid: this.cryptoRepository.randomUUID(),
+      checksum: await this.cryptoRepository.hashFile(sourcePath),
+      originalPath: sourcePath,
+      originalName,
+      size: stat.size,
+    };
+    const body = { filename: originalName };
+
+    this.canUploadFile({ auth, fieldName: UploadFieldName.ASSET_DATA, file, body });
+
+    const uploadFolder = this.getUploadFolder({ auth, fieldName: UploadFieldName.ASSET_DATA, file, body });
+    const uploadFilename = this.getUploadFilename({ auth, fieldName: UploadFieldName.ASSET_DATA, file, body });
+    const uploadPath = join(uploadFolder, uploadFilename);
+
+    await this.storageRepository.copyFile(sourcePath, uploadPath);
+    file.originalPath = uploadPath;
+
+    return this.uploadAsset(
+      auth,
+      {
+        fileCreatedAt: stat.birthtime,
+        fileModifiedAt: stat.mtime,
+        filename: originalName,
+      } as AssetMediaCreateDto,
+      file,
+    );
+  }
+
   async getUploadAssetIdByChecksum(auth: AuthDto, checksum?: string): Promise<AssetMediaResponseDto | undefined> {
     if (!checksum) {
       return;

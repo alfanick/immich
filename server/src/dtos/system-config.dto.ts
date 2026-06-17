@@ -270,6 +270,55 @@ const SystemConfigFacesSchema = z
   .meta({ id: 'SystemConfigFacesDto' });
 const SystemConfigMetadataSchema = z.object({ faces: SystemConfigFacesSchema }).meta({ id: 'SystemConfigMetadataDto' });
 
+const MiniFilmOutputFormatSchema = z.enum(['jpg', 'tiff']).meta({ id: 'MiniFilmOutputFormat' });
+const MiniFilmJpegSubsamplingSchema = z.enum(['s444', 's422', 's420']).meta({ id: 'MiniFilmJpegSubsampling' });
+const MiniFilmGallerySchema = z.enum(['modern', 'soft', 'compact', 'hero', 'phone', 'all', '']).meta({
+  id: 'MiniFilmGallery',
+});
+const MiniFilmGrainPresetSchema = z.enum(['', 'light', 'medium', 'heavy']).meta({ id: 'MiniFilmGrainPreset' });
+
+const SystemConfigMiniFilmSchema = z
+  .object({
+    enabled: configBool.describe('Enabled'),
+    binaryPath: z.string().describe('mini-film binary path'),
+    workRoot: z.string().describe('mini-film workspace root'),
+    profilesRoot: z.string().describe('mini-film profile library root'),
+    haldDir: z.string().describe('mini-film Hald cache directory'),
+    lcpRoot: z.string().describe('Lensfun LCP profile root'),
+    rawtherapeePath: z.string().describe('rawtherapee-cli binary path'),
+    convertPath: z.string().describe('ImageMagick convert binary path'),
+    allowedProfiles: z.array(z.string()).describe('Allowed profile paths'),
+    defaultProfiles: z.array(z.string()).describe('Default profile paths'),
+    maxJobs: z.int().min(1).max(64).describe('Maximum user-selectable mini-film jobs'),
+    defaultJobs: z.int().min(1).max(64).describe('Default mini-film jobs'),
+    reviewPortStart: z.int().min(1).max(65_535).describe('Review proxy port range start'),
+    reviewPortEnd: z.int().min(1).max(65_535).describe('Review proxy port range end'),
+    outputFormat: MiniFilmOutputFormatSchema,
+    jpgQuality: z.int().min(1).max(100).describe('JPEG quality'),
+    jpegSubsampling: MiniFilmJpegSubsamplingSchema,
+    progressive: configBool.describe('Progressive JPEG'),
+    stripMetadata: configBool.describe('Strip metadata'),
+    longEdge: z.int().min(0).describe('Maximum long edge; 0 disables resize'),
+    gallery: MiniFilmGallerySchema,
+    galleryThumbnailLongEdge: z.int().min(1).describe('Gallery thumbnail long edge'),
+    galleryColumns: z.int().min(1).max(20).describe('Gallery columns'),
+    publishAlbum: z.string().describe('Default relative mini-film publish folder'),
+    noGrain: configBool.describe('Disable grain'),
+    colorNoiseIsoThreshold: z.int().min(0).describe('Color noise ISO threshold'),
+    lensCorrections: z.string().describe('Lens correction modes'),
+    grainPreset: MiniFilmGrainPresetSchema,
+    grain: z.string().describe('Grain override'),
+  })
+  .refine((config) => config.reviewPortStart <= config.reviewPortEnd, {
+    error: 'Review port range start must be less than or equal to end',
+    path: ['reviewPortEnd'],
+  })
+  .refine((config) => config.defaultJobs <= config.maxJobs, {
+    error: 'Default jobs must be less than or equal to max jobs',
+    path: ['defaultJobs'],
+  })
+  .meta({ id: 'SystemConfigMiniFilmDto' });
+
 const SystemConfigServerSchema = z
   .object({
     externalDomain: z
@@ -397,6 +446,7 @@ export const SystemConfigSchema = z
     passwordLogin: SystemConfigPasswordLoginSchema,
     reverseGeocoding: SystemConfigReverseGeocodingSchema,
     metadata: SystemConfigMetadataSchema,
+    miniFilm: SystemConfigMiniFilmSchema,
     storageTemplate: SystemConfigStorageTemplateSchema,
     job: SystemConfigJobSchema,
     image: SystemConfigImageSchema,

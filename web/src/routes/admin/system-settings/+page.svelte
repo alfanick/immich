@@ -9,6 +9,7 @@
   import MachineLearningSettings from './MachineLearningSettings.svelte';
   import MapSettings from './MapSettings.svelte';
   import MetadataSettings from './MetadataSettings.svelte';
+  import MiniFilmSettings from './MiniFilmSettings.svelte';
   import NewVersionCheckSettings from './NewVersionCheckSettings.svelte';
   import NightlyTasksSettings from './NightlyTasksSettings.svelte';
   import NotificationSettings from './NotificationSettings.svelte';
@@ -32,6 +33,7 @@
     mdiClockOutline,
     mdiDatabaseOutline,
     mdiFileDocumentOutline,
+    mdiFilmstrip,
     mdiFolderOutline,
     mdiImageOutline,
     mdiLockOutline,
@@ -123,6 +125,13 @@
       subtitle: $t('admin.metadata_settings_description'),
       key: 'metadata',
       icon: mdiDatabaseOutline,
+    },
+    {
+      component: MiniFilmSettings,
+      title: 'mini-film',
+      subtitle: 'RAW profile review and apply workflow',
+      key: 'mini-film',
+      icon: mdiFilmstrip,
     },
     {
       component: NightlyTasksSettings,

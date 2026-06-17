@@ -166,6 +166,7 @@ export const endpointTags: Record<ApiTag, string> = {
     'Map endpoints include supplemental functionality related to geolocation, such as reverse geocoding and retrieving map markers for assets with geolocation data.',
   [ApiTag.Memories]:
     'A memory is a specialized collection of assets with dedicated viewing implementations in the web and mobile clients. A memory includes fields related to visibility and are automatically generated per user via a background job.',
+  [ApiTag.MiniFilm]: 'Endpoints for mini-film profile selection, review sessions, and RAW apply jobs.',
   [ApiTag.Notifications]:
     'A notification is a specialized message sent to users to inform them of important events. Currently, these notifications are only shown in the Immich web application.',
   [ApiTag.NotificationsAdmin]: 'Notification administrative endpoints.',

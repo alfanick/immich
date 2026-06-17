@@ -12,6 +12,28 @@
 <img src="design/immich-logo-stacked-light.svg" width="300" title="Login With Custom URL">
 </p>
 <h3 align="center">High performance self-hosted photo and video management solution</h3>
+
+## Experimental mini-film Integration
+
+This fork contains experimental support for integrating Immich with
+[mini-film](https://github.com/alfanick/mini-film).
+
+mini-film is a RAW photo processing tool for applying film emulation profiles,
+reviewing rendered variants, publishing selected results, and creating finished
+JPEG or TIFF outputs from original RAW files. It provides both a batch apply
+workflow and a daemon-backed review workflow.
+
+The integration adds mini-film configuration to the Immich administration
+settings, including profile/emulation roots, processing defaults, review ports,
+and common mini-film options. Users can select an album or a set of assets in
+Immich, start a mini-film review session from those inputs, review/process the
+images through mini-film, and import the published outputs back into Immich as a
+new album. Users can also run mini-film apply directly on selected RAW assets;
+JPEG, HEIC, and video assets are skipped for apply jobs.
+
+This integration is implemented in Immich and uses mini-film as an external
+binary. No mini-film code changes are required.
+
 <br/>
 <a href="https://immich.app">
 <img src="design/immich-screenshots.png" title="Main Screenshot">
@@ -39,11 +61,8 @@
   <a href="readme_i18n/README_th_TH.md">ภาษาไทย</a>
 </p>
 
-
 > [!WARNING]
 > ⚠️ Always follow [3-2-1](https://www.backblaze.com/blog/the-3-2-1-backup-strategy/) backup plan for your precious photos and videos!
-> 
- 
 
 > [!NOTE]
 > You can find the main documentation, including installation guides, at https://immich.app/.

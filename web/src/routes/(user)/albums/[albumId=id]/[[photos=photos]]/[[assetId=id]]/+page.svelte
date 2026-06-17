@@ -1,6 +1,7 @@
 <script lang="ts">
   import { goto, invalidate, onNavigate } from '$app/navigation';
   import { scrollMemoryClearer } from '$lib/actions/scroll-memory';
+  import ActionMenuItem from '$lib/components/ActionMenuItem.svelte';
   import AlbumMap from '$lib/components/album-page/AlbumMap.svelte';
   import AlbumSummary from '$lib/components/album-page/AlbumSummary.svelte';
   import ActivityStatus from '$lib/components/asset-viewer/ActivityStatus.svelte';
@@ -35,6 +36,7 @@
   import { TimelineManager } from '$lib/managers/timeline-manager/timeline-manager.svelte';
   import type { TimelineAsset } from '$lib/managers/timeline-manager/types';
   import AlbumOptionsModal from '$lib/modals/AlbumOptionsModal.svelte';
+  import MiniFilmWorkflowModal from '$lib/modals/MiniFilmWorkflowModal.svelte';
   import { Route } from '$lib/route';
   import {
     getAlbumActions,
@@ -66,6 +68,7 @@
     mdiDotsHorizontal,
     mdiDotsVertical,
     mdiDownload,
+    mdiFilmstrip,
     mdiImageOutline,
     mdiImagePlusOutline,
     mdiLink,
@@ -466,6 +469,8 @@
         {/if}
         <ButtonContextMenu icon={mdiDotsVertical} title={$t('menu')} offset={{ x: 175, y: 25 }}>
           <DownloadAction menuItem filename="{album.albumName}.zip" />
+          <ActionMenuItem action={Actions.MiniFilmReview} />
+          <ActionMenuItem action={Actions.MiniFilmApply} />
           {#if assetMultiSelectManager.isAllUserOwned}
             <ChangeDate menuItem />
             <ChangeDescription menuItem />
@@ -562,6 +567,16 @@
                   />
                 {/if}
                 {#if isOwned && album.assetCount > 0}
+                  <MenuOption
+                    icon={mdiFilmstrip}
+                    text="mini-film review"
+                    onClick={() =>
+                      modalManager.show(MiniFilmWorkflowModal, {
+                        mode: 'review',
+                        albumId: album.id,
+                        defaultAlbumName: album.albumName,
+                      })}
+                  />
                   <MenuOption
                     icon={mdiImageOutline}
                     text={$t('select_album_cover')}
