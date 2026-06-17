@@ -87,6 +87,40 @@ ENV NODE_ENV=production \
   NVIDIA_DRIVER_CAPABILITIES=all \
   NVIDIA_VISIBLE_DEVICES=all
 
+ARG TARGETARCH
+ARG MINI_FILM_REPO=alfanick/mini-film
+ARG MINI_FILM_VERSION=latest
+
+RUN set -eux; \
+  apt-get update; \
+  apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    imagemagick \
+    libimage-exiftool-perl \
+    rawtherapee; \
+  rm -rf /var/lib/apt/lists/*; \
+  target_arch="${TARGETARCH:-$(uname -m)}"; \
+  case "${target_arch}" in \
+    amd64|x86_64) mini_film_arch="x86_64-unknown-linux-gnu" ;; \
+    arm64|aarch64) mini_film_arch="aarch64-unknown-linux-gnu" ;; \
+    *) echo "unsupported target architecture for mini-film: ${target_arch}" >&2; exit 1 ;; \
+  esac; \
+  mini_film_version="${MINI_FILM_VERSION}"; \
+  if [ "${mini_film_version}" = "latest" ]; then \
+    mini_film_latest_url="$(curl -fsSIL -o /dev/null -w '%{url_effective}' "https://github.com/${MINI_FILM_REPO}/releases/latest")"; \
+    mini_film_version="${mini_film_latest_url##*/}"; \
+  fi; \
+  curl -fsSL \
+    -o /usr/local/bin/mini-film \
+    "https://github.com/${MINI_FILM_REPO}/releases/download/${mini_film_version}/mini-film-${mini_film_version}-${mini_film_arch}"; \
+  chmod 0755 /usr/local/bin/mini-film; \
+  mini-film --version; \
+  command -v rawtherapee-cli; \
+  rawtherapee-cli --version || true; \
+  exiftool -ver; \
+  convert -version >/dev/null
+
 COPY --from=server /output/server-pruned ./server
 COPY --from=web /usr/src/app/web/build /build/www
 COPY --from=cli /output/cli-pruned ./cli
