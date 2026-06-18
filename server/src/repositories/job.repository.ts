@@ -266,6 +266,7 @@ export class JobRepository {
       case JobName.PersonGenerateThumbnail: {
         return { priority: 1 };
       }
+      case JobName.AssetExtractMetadata:
       case JobName.AssetGenerateThumbnails: {
         return item.data.priority ? { priority: item.data.priority } : null;
       }

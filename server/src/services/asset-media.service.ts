@@ -42,9 +42,18 @@ export interface AssetMediaRedirectResponse {
   targetSize: AssetMediaSize | 'original';
 }
 
+type AssetUploadOptions = {
+  jobPriority?: number;
+};
+
 @Injectable()
 export class AssetMediaService extends BaseService {
-  async importLocalAsset(auth: AuthDto, sourcePath: string, originalName = basename(sourcePath)) {
+  async importLocalAsset(
+    auth: AuthDto,
+    sourcePath: string,
+    originalName = basename(sourcePath),
+    options: AssetUploadOptions = {},
+  ) {
     const stat = await this.storageRepository.stat(sourcePath);
     if (!stat.isFile()) {
       throw new BadRequestException(`Cannot import non-file path ${sourcePath}`);
@@ -76,6 +85,8 @@ export class AssetMediaService extends BaseService {
         filename: originalName,
       } as AssetMediaCreateDto,
       file,
+      undefined,
+      options,
     );
   }
 
@@ -164,6 +175,7 @@ export class AssetMediaService extends BaseService {
     dto: AssetMediaCreateDto,
     file: UploadFile,
     sidecarFile?: UploadFile,
+    options: AssetUploadOptions = {},
   ): Promise<AssetMediaResponseDto> {
     try {
       await this.requireAccess({
@@ -220,7 +232,10 @@ export class AssetMediaService extends BaseService {
         lockedPropertiesBehavior: 'override',
       });
 
-      await this.jobRepository.queue({ name: JobName.AssetExtractMetadata, data: { id: asset.id, source: 'upload' } });
+      await this.jobRepository.queue({
+        name: JobName.AssetExtractMetadata,
+        data: { id: asset.id, source: 'upload', priority: options.jobPriority },
+      });
 
       if (auth.sharedLink) {
         await this.addToSharedLink(auth.sharedLink, asset.id);

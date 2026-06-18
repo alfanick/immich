@@ -86,11 +86,10 @@ type MiniFilmLiveImportWatcher = {
   importedFiles: Set<string>;
   importingFiles: Set<string>;
   seenFiles: Map<string, { size: number; mtimeMs: number }>;
+  completedPublishJobs: Set<string>;
   scanPromise?: Promise<void>;
   completionPromise?: Promise<void>;
-  publishCompleted: boolean;
   publishFailed: boolean;
-  expectedImported: number;
   stopped: boolean;
 };
 
@@ -160,7 +159,7 @@ type ProfileNodeMutable = {
 const MAX_LOG_LENGTH = 64 * 1024;
 const IMPORT_SCAN_INTERVAL_MS = 1000;
 const IMPORT_STABLE_DELAY_MS = 750;
-const MINI_FILM_THUMBNAIL_PRIORITY = 1;
+const MINI_FILM_JOB_PRIORITY = 1;
 
 @Injectable()
 export class MiniFilmService extends BaseService {
@@ -188,6 +187,8 @@ export class MiniFilmService extends BaseService {
     if (assets.length === 0) {
       throw new BadRequestException('No supported image assets selected for mini-film review');
     }
+
+    await this.stopActiveReviewSessionsForUser(auth.user.id);
 
     const id = this.cryptoRepository.randomUUID();
     const createdAt = new Date().toISOString();
@@ -781,7 +782,7 @@ export class MiniFilmService extends BaseService {
         id,
         (current) => ({
           ...current,
-          status: 'imported',
+          status: this.reviewProcesses.has(id) ? 'running' : 'imported',
           importedAlbumId: albumId,
           importedAssetIds,
           progress: this.withProgressStatus(current.progress, 'completed', 'mini-film review imported into Immich', {
@@ -793,9 +794,6 @@ export class MiniFilmService extends BaseService {
         }),
         { emitProgress: true },
       );
-      this.stopReviewProcess(id);
-      void this.stopReviewHistoryWatcher(id);
-      void this.stopReviewLiveImportWatcher(id);
     } catch (error: any) {
       this.stopReviewImportProcess(id);
       void this.stopReviewLiveImportWatcher(id);
@@ -869,9 +867,8 @@ export class MiniFilmService extends BaseService {
       importedFiles: new Set(),
       importingFiles: new Set(),
       seenFiles: new Map(),
-      publishCompleted: false,
+      completedPublishJobs: new Set(),
       publishFailed: false,
-      expectedImported: 0,
       stopped: false,
     };
 
@@ -916,11 +913,6 @@ export class MiniFilmService extends BaseService {
       watcherState.scanPromise = undefined;
     });
     await watcherState.scanPromise;
-
-    const latestWatcherState = this.reviewLiveImportWatchers.get(id);
-    if (latestWatcherState?.publishCompleted) {
-      void this.completeReviewLiveImportIfReady(id);
-    }
   }
 
   private triggerReviewLiveImportScan(id: string) {
@@ -934,18 +926,24 @@ export class MiniFilmService extends BaseService {
     ).catch(() => {});
   }
 
-  private markReviewLivePublishState(id: string, completed: boolean, failed: boolean, expectedImported: number) {
+  private markReviewLivePublishState(id: string, completedPublishJobIds: string[], failed: boolean) {
     const watcherState = this.reviewLiveImportWatchers.get(id);
     if (!watcherState) {
       return;
     }
 
-    watcherState.publishCompleted ||= completed;
     watcherState.publishFailed ||= failed;
-    watcherState.expectedImported = Math.max(watcherState.expectedImported, expectedImported);
     this.triggerReviewLiveImportScan(id);
 
-    if (watcherState.publishCompleted) {
+    const hasNewCompletedPublishJob = completedPublishJobIds.some((publishJobId) => {
+      if (watcherState.completedPublishJobs.has(publishJobId)) {
+        return false;
+      }
+      watcherState.completedPublishJobs.add(publishJobId);
+      return true;
+    });
+
+    if (hasNewCompletedPublishJob) {
       void this.completeReviewLiveImportIfReady(id);
     }
   }
@@ -980,15 +978,12 @@ export class MiniFilmService extends BaseService {
     if (importedAssetIds.length === 0) {
       return;
     }
-    if (watcherState.expectedImported > 0 && importedAssetIds.length < watcherState.expectedImported) {
-      return;
-    }
 
     await this.patchReviewSession(
       id,
       (current) => ({
         ...current,
-        status: 'imported',
+        status: 'running',
         importedAlbumId: watcherState.albumId,
         importedAssetIds,
         progress: this.withProgressStatus(current.progress, 'completed', 'mini-film review imported into Immich', {
@@ -1002,9 +997,6 @@ export class MiniFilmService extends BaseService {
       }),
       { emitProgress: true },
     );
-    this.stopReviewProcess(id);
-    void this.stopReviewHistoryWatcher(id);
-    void this.stopReviewLiveImportWatcher(id);
   }
 
   private async importReadyReviewOutputs(
@@ -1068,7 +1060,9 @@ export class MiniFilmService extends BaseService {
     }
 
     const assetService = BaseService.create(AssetMediaService, this);
-    const result = await assetService.importLocalAsset(auth, file, path.basename(file));
+    const result = await assetService.importLocalAsset(auth, file, path.basename(file), {
+      jobPriority: MINI_FILM_JOB_PRIORITY,
+    });
     if (!result.id) {
       return;
     }
@@ -1082,7 +1076,7 @@ export class MiniFilmService extends BaseService {
   private async queueMiniFilmThumbnail(assetId: string) {
     await this.jobRepository.queue({
       name: JobName.AssetGenerateThumbnails,
-      data: { id: assetId, source: 'upload', notify: true, priority: MINI_FILM_THUMBNAIL_PRIORITY },
+      data: { id: assetId, source: 'upload', notify: true, priority: MINI_FILM_JOB_PRIORITY },
     });
   }
 
@@ -1143,6 +1137,44 @@ export class MiniFilmService extends BaseService {
     });
   }
 
+  private async stopActiveReviewSessionsForUser(userId: string) {
+    const state = await this.getState();
+    const sessions = Object.values(state.reviewSessions).filter(
+      (session) =>
+        session.userId === userId &&
+        (session.status === 'running' ||
+          session.status === 'importing' ||
+          this.reviewProcesses.has(session.id) ||
+          this.reviewImportProcesses.has(session.id) ||
+          this.reviewHistoryWatchers.has(session.id) ||
+          this.reviewLiveImportWatchers.has(session.id)),
+    );
+
+    for (const session of sessions) {
+      this.stopReviewImportProcess(session.id);
+      this.stopReviewProcess(session.id);
+      await Promise.all([this.stopReviewHistoryWatcher(session.id), this.stopReviewLiveImportWatcher(session.id)]);
+      await this.patchReviewSession(
+        session.id,
+        (current) => ({
+          ...current,
+          status: current.status === 'failed' || current.status === 'imported' ? current.status : 'stopped',
+          progress:
+            current.status === 'failed' || current.status === 'imported'
+              ? current.progress
+              : this.withProgressStatus(
+                  current.progress,
+                  'completed',
+                  'mini-film review stopped because a new review was started',
+                  { currentFile: undefined, currentProfile: undefined },
+                ),
+          updatedAt: new Date().toISOString(),
+        }),
+        { emitProgress: true },
+      );
+    }
+  }
+
   private async readReviewHistory(id: string, watcherState: MiniFilmHistoryWatcher, historyPath: string) {
     const stat = await fs.stat(historyPath).catch(() => null);
     if (!stat?.isFile()) {
@@ -1201,10 +1233,10 @@ export class MiniFilmService extends BaseService {
     );
 
     if (watcherState.publishJobs.size > 0) {
-      const expectedImported = [...watcherState.publishJobs.values()]
+      const completedPublishJobIds = [...watcherState.publishJobs.values()]
         .filter((item) => item.status === 'done')
-        .reduce((sum, item) => sum + item.linked, 0);
-      this.markReviewLivePublishState(id, watcherState.publishCompleted, watcherState.publishFailed, expectedImported);
+        .map((item) => item.id);
+      this.markReviewLivePublishState(id, completedPublishJobIds, watcherState.publishFailed);
     }
   }
 
@@ -1399,6 +1431,7 @@ export class MiniFilmService extends BaseService {
   ): MiniFilmProgress {
     const publishItems = [...watcherState.publishJobs.values()];
     if (publishItems.length > 0) {
+      const hasRunningPublish = publishItems.some((item) => item.status === 'running');
       const processed = publishItems.reduce(
         (sum, item) => sum + (item.status === 'done' ? Math.max(item.processed, item.total) : item.processed),
         0,
@@ -1412,7 +1445,9 @@ export class MiniFilmService extends BaseService {
             ? 'failed'
             : session.status === 'imported'
               ? 'completed'
-              : 'importing',
+              : hasRunningPublish
+                ? 'importing'
+                : 'completed',
         processed,
         total,
         percent: this.progressPercent(processed, total),
