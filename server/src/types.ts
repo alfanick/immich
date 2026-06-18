@@ -225,6 +225,7 @@ export type JobOf<T extends JobName> = Jobs[T];
 
 export interface IBaseJob {
   force?: boolean;
+  priority?: number;
 }
 
 export interface IDelayedJob extends IBaseJob {

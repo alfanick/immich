@@ -1,5 +1,6 @@
 <script lang="ts">
   import { goto } from '$app/navigation';
+  import MiniFilmActivityModal from '$lib/modals/MiniFilmActivityModal.svelte';
   import { Route } from '$lib/route';
   import {
     createMiniFilmApplyJob,
@@ -9,7 +10,8 @@
     type MiniFilmProfileNode,
     type MiniFilmReviewSession,
   } from '$lib/services/mini-film.service';
-  import { Button, Checkbox, Field, FormModal, Input, Label, toastManager } from '@immich/ui';
+  import { miniFilmProgressStore, type MiniFilmActivityItem } from '$lib/stores/mini-film-progress.store';
+  import { Button, Checkbox, Field, FormModal, Input, Label, modalManager, toastManager } from '@immich/ui';
   import { mdiFilmstrip } from '@mdi/js';
   import { onMount } from 'svelte';
   import { SvelteSet } from 'svelte/reactivity';
@@ -30,8 +32,9 @@
   const { onClose, mode, assetIds = [], albumId, defaultAlbumName = '' }: Props = $props();
 
   let albumName = $state(defaultAlbumName);
-  let profileRows = $state<ProfileRow[]>([]);
+  let profileNodes = $state<MiniFilmProfileNode[]>([]);
   let profileRoot = $state('');
+  let profileSearch = $state('');
   let profileError = $state('');
   let loadingProfiles = $state(false);
   let submitting = $state(false);
@@ -41,18 +44,55 @@
   const title = $derived(mode === 'review' ? 'mini-film review' : 'mini-film apply');
   const submitText = $derived(reviewSession ? 'Import to Immich' : mode === 'review' ? 'Start review' : 'Apply');
 
-  const flattenProfiles = (nodes: MiniFilmProfileNode[], depth = 0, prefix = ''): ProfileRow[] => {
+  const normalizeSearch = (value: string) =>
+    value
+      .toLowerCase()
+      .replaceAll(/[^a-z0-9]+/g, ' ')
+      .trim();
+
+  const fuzzyMatchToken = (value: string, token: string) => {
+    if (value.includes(token)) {
+      return true;
+    }
+
+    let index = 0;
+    for (const char of value) {
+      if (char === token[index]) {
+        index += 1;
+      }
+      if (index === token.length) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  const fuzzyMatch = (value: string, query: string) => {
+    const normalizedValue = normalizeSearch(value);
+    const tokens = normalizeSearch(query).split(/\s+/).filter(Boolean);
+    return tokens.every((token) => fuzzyMatchToken(normalizedValue, token));
+  };
+
+  const profileMatches = (profile: ProfileRow & { type: 'profile' }, query: string) =>
+    fuzzyMatch(`${profile.name} ${profile.relative} ${profile.path}`, query);
+
+  const flattenProfiles = (nodes: MiniFilmProfileNode[], depth = 0, prefix = '', query = ''): ProfileRow[] => {
     const rows: ProfileRow[] = [];
     for (const node of nodes) {
       const id = `${prefix}/${node.label}`;
-      rows.push({ type: 'node', id, label: node.label, depth });
-      for (const profile of node.profiles) {
-        rows.push({ type: 'profile', id: profile.path, depth: depth + 1, ...profile });
+      const nodeMatches = fuzzyMatch(node.label, query);
+      const profiles = node.profiles
+        .map((profile) => ({ type: 'profile' as const, id: profile.path, depth: depth + 1, ...profile }))
+        .filter((profile) => nodeMatches || profileMatches(profile, query));
+      const children = flattenProfiles(node.children, depth + 1, id, query);
+      if (!query || nodeMatches || profiles.length > 0 || children.length > 0) {
+        rows.push({ type: 'node', id, label: node.label, depth }, ...profiles, ...children);
       }
-      rows.push(...flattenProfiles(node.children, depth + 1, id));
     }
     return rows;
   };
+
+  const profileRows = $derived(flattenProfiles(profileNodes, 0, '', profileSearch));
 
   const loadProfiles = async () => {
     loadingProfiles = true;
@@ -60,7 +100,7 @@
     try {
       const tree = await getMiniFilmProfileTree();
       profileRoot = tree.root;
-      profileRows = flattenProfiles(tree.children);
+      profileNodes = tree.children;
     } catch (error) {
       profileError = error instanceof Error ? error.message : String(error);
     } finally {
@@ -76,11 +116,23 @@
     }
   };
 
+  const showActivity = (item: MiniFilmActivityItem) => {
+    miniFilmProgressStore.upsertItem(item);
+    setTimeout(() => void modalManager.show(MiniFilmActivityModal, { item }), 0);
+  };
+
   const onSubmit = async () => {
     submitting = true;
     try {
       if (reviewSession) {
         const result = await importMiniFilmReviewSession(reviewSession.id, albumName || undefined);
+        reviewSession = result.session;
+        showActivity({
+          mode: 'review',
+          id: result.session.id,
+          session: result.session,
+          updatedAt: result.session.progress.updatedAt,
+        });
         toastManager.primary({
           description: 'mini-film import started',
           button: { label: $t('view_album'), onclick: () => goto(Route.viewAlbum({ id: result.albumId })) },
@@ -98,9 +150,16 @@
           albumName: albumName || undefined,
         });
         reviewSession = session;
+        showActivity({ mode: 'review', id: session.id, session, updatedAt: session.progress.updatedAt });
         toastManager.primary({
           description: `mini-film review started${session.skippedAssets.length > 0 ? `, skipped ${session.skippedAssets.length}` : ''}`,
-          button: { label: 'Open review', onclick: () => globalThis.open(session.reviewUrl, '_blank') },
+          button: {
+            label: 'View progress',
+            onclick: () =>
+              void modalManager.show(MiniFilmActivityModal, {
+                item: { mode: 'review', id: session.id, session, updatedAt: session.progress.updatedAt },
+              }),
+          },
         });
         return;
       } else {
@@ -109,17 +168,32 @@
           profiles,
           albumName: albumName || undefined,
         });
+        const item: MiniFilmActivityItem = {
+          mode: 'apply',
+          id: job.id,
+          job,
+          updatedAt: job.progress.updatedAt,
+        };
+        showActivity(item);
         const description = `mini-film apply queued for ${job.rawAssetIds.length} RAW asset${job.rawAssetIds.length === 1 ? '' : 's'}${
           job.skippedAssets.length > 0 ? `, skipped ${job.skippedAssets.length}` : ''
         }`;
         if (job.albumId) {
-          const albumId = job.albumId;
           toastManager.primary({
             description,
-            button: { label: $t('view_album'), onclick: () => goto(Route.viewAlbum({ id: albumId })) },
+            button: {
+              label: 'View progress',
+              onclick: () => void modalManager.show(MiniFilmActivityModal, { item }),
+            },
           });
         } else {
-          toastManager.primary(description);
+          toastManager.primary({
+            description,
+            button: {
+              label: 'View progress',
+              onclick: () => void modalManager.show(MiniFilmActivityModal, { item }),
+            },
+          });
         }
       }
       onClose(true);
@@ -168,6 +242,10 @@
           {loadingProfiles ? 'Loading' : 'Refresh'}
         </button>
       </div>
+
+      <Field label="Filter profiles">
+        <Input bind:value={profileSearch} placeholder="Search by name or path" />
+      </Field>
 
       {#if profileError}
         <p class="text-sm text-red-600">{profileError}</p>

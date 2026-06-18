@@ -9,6 +9,7 @@ import {
 import { Server, Socket } from 'socket.io';
 import { AssetResponseDto } from 'src/dtos/asset-response.dto';
 import { AuthDto } from 'src/dtos/auth.dto';
+import { MiniFilmProgressEvent } from 'src/dtos/mini-film.dto';
 import { NotificationDto } from 'src/dtos/notification.dto';
 import { ReleaseEventV1, ServerVersionResponseDto } from 'src/dtos/server.dto';
 import { SyncAssetEditV1, SyncAssetExifV1, SyncAssetV2 } from 'src/dtos/sync.dto';
@@ -38,6 +39,7 @@ export interface ClientEventMap {
   on_asset_restore: [string[]];
   on_asset_stack_update: string[];
   on_album_asset_add: [{ albumId: string; asset: AssetResponseDto }];
+  on_mini_film_progress: [MiniFilmProgressEvent];
   on_person_thumbnail: [string];
   on_server_version: [ServerVersionResponseDto];
   on_config_update: [];

@@ -14,6 +14,7 @@ import { page } from '$app/state';
 import { authManager } from '$lib/managers/auth-manager.svelte';
 import { eventManager } from '$lib/managers/event-manager.svelte';
 import { Route } from '$lib/route';
+import type { MiniFilmProgressEvent } from '$lib/services/mini-film.service';
 import { maintenanceStore } from '$lib/stores/maintenance.store';
 import { notificationManager } from '$lib/stores/notification-manager.svelte';
 import { createEventEmitter } from '$lib/utils/eventemitter';
@@ -32,6 +33,7 @@ export interface Events {
   on_asset_restore: (assetIds: string[]) => void;
   on_asset_stack_update: (assetIds: string[]) => void;
   on_album_asset_add: (event: { albumId: string; asset: AssetResponseDto }) => void;
+  on_mini_film_progress: (event: MiniFilmProgressEvent) => void;
   on_person_thumbnail: (personId: string) => void;
   on_server_version: (serverVersion: ServerVersionResponseDto) => void;
   on_config_update: () => void;

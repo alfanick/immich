@@ -22,6 +22,19 @@ export type MiniFilmSkippedAsset = {
   reason: string;
 };
 
+export type MiniFilmProgress = {
+  stage: 'starting' | 'discovering' | 'rendering' | 'importing' | 'completed' | 'failed';
+  processed: number;
+  total: number;
+  percent: number;
+  currentFile?: string;
+  currentProfile?: string;
+  message?: string;
+  updatedAt: string;
+  imported?: number;
+  skipped?: number;
+};
+
 export type MiniFilmReviewSession = {
   id: string;
   name: string;
@@ -30,6 +43,7 @@ export type MiniFilmReviewSession = {
   skippedAssets: MiniFilmSkippedAsset[];
   importedAlbumId?: string;
   importedAssetIds?: string[];
+  progress: MiniFilmProgress;
 };
 
 export type MiniFilmApplyJob = {
@@ -40,6 +54,7 @@ export type MiniFilmApplyJob = {
   total: number;
   albumId?: string;
   importedAssetIds?: string[];
+  progress: MiniFilmProgress;
 };
 
 export type MiniFilmImportResult = {
@@ -47,6 +62,15 @@ export type MiniFilmImportResult = {
   assetIds: string[];
   imported: number;
   session: MiniFilmReviewSession;
+};
+
+export type MiniFilmProgressEvent = {
+  mode: 'apply' | 'review';
+  id: string;
+  status: MiniFilmApplyJob['status'] | MiniFilmReviewSession['status'];
+  progress: MiniFilmProgress;
+  albumId?: string;
+  importedAssetIds?: string[];
 };
 
 type ReviewSessionRequest = {
@@ -89,11 +113,19 @@ export const createMiniFilmReviewSession = (dto: ReviewSessionRequest) =>
     body: JSON.stringify(dto),
   });
 
+export const listMiniFilmReviewSessions = () => miniFilmFetch<MiniFilmReviewSession[]>('/review-sessions');
+
+export const getMiniFilmReviewSession = (id: string) => miniFilmFetch<MiniFilmReviewSession>(`/review-sessions/${id}`);
+
 export const createMiniFilmApplyJob = (dto: ApplyJobRequest) =>
   miniFilmFetch<MiniFilmApplyJob>('/apply-jobs', {
     method: 'POST',
     body: JSON.stringify(dto),
   });
+
+export const listMiniFilmApplyJobs = () => miniFilmFetch<MiniFilmApplyJob[]>('/apply-jobs');
+
+export const getMiniFilmApplyJob = (id: string) => miniFilmFetch<MiniFilmApplyJob>(`/apply-jobs/${id}`);
 
 export const importMiniFilmReviewSession = (id: string, albumName?: string) =>
   miniFilmFetch<MiniFilmImportResult>(`/review-sessions/${id}/import`, {

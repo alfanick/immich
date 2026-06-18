@@ -95,6 +95,40 @@ const MiniFilmSkippedAssetSchema = z
 
 const MiniFilmReviewSessionStatusSchema = z.enum(['starting', 'running', 'stopped', 'failed', 'importing', 'imported']);
 const MiniFilmApplyJobStatusSchema = z.enum(['queued', 'running', 'completed', 'failed']);
+const MiniFilmProgressStageSchema = z.enum([
+  'starting',
+  'discovering',
+  'rendering',
+  'importing',
+  'completed',
+  'failed',
+]);
+
+const MiniFilmProgressSchema = z
+  .object({
+    stage: MiniFilmProgressStageSchema,
+    processed: z.int().min(0),
+    total: z.int().min(0),
+    percent: z.number().min(0).max(1),
+    currentFile: z.string().optional(),
+    currentProfile: z.string().optional(),
+    message: z.string().optional(),
+    updatedAt: z.string(),
+    imported: z.int().min(0).optional(),
+    skipped: z.int().min(0).optional(),
+  })
+  .meta({ id: 'MiniFilmProgressDto' });
+
+const MiniFilmProgressEventSchema = z
+  .object({
+    mode: z.enum(['apply', 'review']),
+    id: z.string(),
+    status: z.string(),
+    progress: MiniFilmProgressSchema,
+    albumId: z.string().optional(),
+    importedAssetIds: z.array(z.string()).optional(),
+  })
+  .meta({ id: 'MiniFilmProgressEventDto' });
 
 const MiniFilmReviewSessionResponseSchema = z
   .object({
@@ -107,6 +141,7 @@ const MiniFilmReviewSessionResponseSchema = z
     inputDir: z.string(),
     outputDir: z.string(),
     statePath: z.string(),
+    historyPath: z.string(),
     publishAlbum: z.string(),
     assetIds: z.array(z.string()),
     skippedAssets: z.array(MiniFilmSkippedAssetSchema),
@@ -118,6 +153,7 @@ const MiniFilmReviewSessionResponseSchema = z
     logs: z.string().optional(),
     importedAlbumId: z.string().optional(),
     importedAssetIds: z.array(z.string()).optional(),
+    progress: MiniFilmProgressSchema,
   })
   .meta({ id: 'MiniFilmReviewSessionResponseDto' });
 
@@ -140,6 +176,7 @@ const MiniFilmApplyJobResponseSchema = z
     error: z.string().optional(),
     albumId: z.string().optional(),
     importedAssetIds: z.array(z.string()).optional(),
+    progress: MiniFilmProgressSchema,
   })
   .meta({ id: 'MiniFilmApplyJobResponseDto' });
 
@@ -159,6 +196,10 @@ export class MiniFilmReviewSessionImportDto extends createZodDto(MiniFilmReviewS
 export class MiniFilmReviewSessionResponseDto extends createZodDto(MiniFilmReviewSessionResponseSchema) {}
 export class MiniFilmApplyJobResponseDto extends createZodDto(MiniFilmApplyJobResponseSchema) {}
 export class MiniFilmImportResponseDto extends createZodDto(MiniFilmImportResponseSchema) {}
+export class MiniFilmProgressDto extends createZodDto(MiniFilmProgressSchema) {}
+export class MiniFilmProgressEventDto extends createZodDto(MiniFilmProgressEventSchema) {}
 
 export type MiniFilmProfileLeafDto = z.infer<typeof MiniFilmProfileLeafSchema>;
 export type MiniFilmProfileNodeDto = MiniFilmProfileNode;
+export type MiniFilmProgress = z.infer<typeof MiniFilmProgressSchema>;
+export type MiniFilmProgressEvent = z.infer<typeof MiniFilmProgressEventSchema>;
