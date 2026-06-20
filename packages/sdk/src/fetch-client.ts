@@ -1,6 +1,6 @@
 /**
  * Immich
- * 3.0.0-rc.1
+ * 3.0.0-rc.2
  * DO NOT MODIFY - This file has been generated using oazapfts.
  * See https://www.npmjs.com/package/oazapfts
  */
@@ -2532,7 +2532,7 @@ export type SystemConfigNightlyTasksDto = {
     generateMemories: boolean;
     /** Missing thumbnails */
     missingThumbnails: boolean;
-    /** Start time */
+    /** Start time (HH:MM) */
     startTime: string;
     /** Sync quota usage */
     syncQuotaUsage: boolean;

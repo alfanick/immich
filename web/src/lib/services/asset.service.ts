@@ -30,6 +30,7 @@ import {
   mdiMotionPauseOutline,
   mdiMotionPlayOutline,
   mdiPlus,
+  mdiPresentationPlay,
   mdiShareVariantOutline,
   mdiTagPlusOutline,
   mdiTune,
@@ -44,6 +45,7 @@ import AssetAddToAlbumModal from '$lib/modals/AssetAddToAlbumModal.svelte';
 import AssetTagModal from '$lib/modals/AssetTagModal.svelte';
 import MiniFilmWorkflowModal from '$lib/modals/MiniFilmWorkflowModal.svelte';
 import SharedLinkCreateModal from '$lib/modals/SharedLinkCreateModal.svelte';
+import { SlideshowState, slideshowStore } from '$lib/stores/slideshow.store';
 import { getAssetMediaUrl, getSharedLink, sleep } from '$lib/utils';
 import { downloadUrl } from '$lib/utils';
 import { handleError } from '$lib/utils/handle-error';
@@ -185,6 +187,13 @@ export const getAssetActions = ($t: MessageFormatter, asset: AssetResponseDto) =
     },
   };
 
+  const PlaySlideshow: ActionItem = {
+    title: $t('slideshow'),
+    icon: mdiPresentationPlay,
+    $if: () => asset.visibility !== AssetVisibility.Locked,
+    onAction: () => slideshowStore.slideshowState.set(SlideshowState.PlaySlideshow),
+  };
+
   const Favorite: ActionItem = {
     title: $t('to_favorite'),
     icon: mdiHeartOutline,
@@ -314,6 +323,7 @@ export const getAssetActions = ($t: MessageFormatter, asset: AssetResponseDto) =
     Unfavorite,
     PlayMotionPhoto,
     StopMotionPhoto,
+    PlaySlideshow,
     AddToAlbum,
     ZoomIn,
     ZoomOut,
