@@ -2403,6 +2403,8 @@ export type SystemConfigJobDto = {
 export type SystemConfigLibraryScanDto = {
     /** Cron expression */
     cronExpression: string;
+    /** Health check URL */
+    healthCheckUrl: string;
     /** Enabled */
     enabled: boolean;
 };

@@ -207,6 +207,7 @@ export type SystemConfig = {
     scan: {
       enabled: boolean;
       cronExpression: string;
+      healthCheckUrl: string;
     };
     watch: {
       enabled: boolean;
@@ -468,6 +469,7 @@ export const defaults = Object.freeze<SystemConfig>({
     scan: {
       enabled: true,
       cronExpression: CronExpression.EVERY_DAY_AT_MIDNIGHT,
+      healthCheckUrl: '',
     },
     watch: {
       enabled: false,

@@ -219,6 +219,7 @@ const updatedConfig = Object.freeze<SystemConfig>({
     scan: {
       enabled: true,
       cronExpression: '0 0 * * *',
+      healthCheckUrl: '',
     },
     watch: {
       enabled: false,

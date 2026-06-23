@@ -128,6 +128,17 @@ describe(QueueService.name, () => {
       expect(mocks.job.queue).toHaveBeenCalledWith({ name: JobName.AssetEncodeVideoQueueAll, data: { force: false } });
     });
 
+    it('should handle a start library command', async () => {
+      mocks.job.isActive.mockResolvedValue(false);
+      mocks.job.getJobCounts.mockResolvedValue(factory.queueStatistics());
+      await sut.runCommandLegacy(QueueName.Library, { command: QueueCommand.Start, force: false });
+
+      expect(mocks.job.queue).toHaveBeenCalledWith({
+        name: JobName.LibraryScanQueueAll,
+        data: { force: false, runId: expect.any(String) },
+      });
+    });
+
     it('should handle a start storage template migration command', async () => {
       mocks.job.isActive.mockResolvedValue(false);
       mocks.job.getJobCounts.mockResolvedValue(factory.queueStatistics());

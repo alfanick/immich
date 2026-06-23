@@ -64,6 +64,16 @@
 
             <SettingInputField
               inputType={SettingInputFieldType.TEXT}
+              required={false}
+              disabled={disabled || !configToEdit.library.scan.enabled}
+              label={$t('admin.library_scan_health_check_url')}
+              description={$t('admin.library_scan_health_check_url_description')}
+              bind:value={configToEdit.library.scan.healthCheckUrl}
+              isEdited={configToEdit.library.scan.healthCheckUrl !== config.library.scan.healthCheckUrl}
+            />
+
+            <SettingInputField
+              inputType={SettingInputFieldType.TEXT}
               required={true}
               disabled={disabled || !configToEdit.library.scan.enabled}
               label={$t('admin.cron_expression')}

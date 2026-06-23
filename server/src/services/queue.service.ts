@@ -1,4 +1,5 @@
 import { BadRequestException, Injectable } from '@nestjs/common';
+import { randomUUID } from 'node:crypto';
 import { SystemConfig } from 'src/config';
 import { OnEvent } from 'src/decorators';
 import { AuthDto } from 'src/dtos/auth.dto';
@@ -239,7 +240,9 @@ export class QueueService extends BaseService {
       }
 
       case QueueName.Library: {
-        return this.jobRepository.queue({ name: JobName.LibraryScanQueueAll, data: { force } });
+        const runId = randomUUID();
+        this.logger.log(`Queue start for library scan requested manually with runId ${runId} force=${force}`);
+        return this.jobRepository.queue({ name: JobName.LibraryScanQueueAll, data: { force, runId } });
       }
 
       case QueueName.BackupDatabase: {

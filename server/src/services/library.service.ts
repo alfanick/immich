@@ -1,6 +1,7 @@
 import { BadRequestException, Injectable } from '@nestjs/common';
 import { Insertable } from 'kysely';
 import { R_OK } from 'node:constants';
+import { randomUUID } from 'node:crypto';
 import { Stats } from 'node:fs';
 import path, { isAbsolute, parse } from 'node:path';
 import picomatch from 'picomatch';
@@ -28,7 +29,7 @@ import {
   JobStatus,
   QueueName,
 } from 'src/enum';
-import { ArgOf } from 'src/repositories/event.repository';
+import { ArgOf, ArgsOf } from 'src/repositories/event.repository';
 import { AssetSyncResult } from 'src/repositories/library.repository';
 import { AssetTable } from 'src/schema/tables/asset.table';
 import { BaseService } from 'src/services/base.service';
@@ -36,11 +37,242 @@ import { JobOf } from 'src/types';
 import { mimeTypes } from 'src/utils/mime-types';
 import { handlePromiseError } from 'src/utils/misc';
 
+type LibraryScanRunState = {
+  healthCheckUrl: string;
+  pendingJobs: number;
+  hasFailure: boolean;
+};
+
 @Injectable()
 export class LibraryService extends BaseService {
   private watchLibraries = false;
   private lock = false;
   private watchers: Record<string, () => Promise<void>> = {};
+  private libraryScanRuns = new Map<string, LibraryScanRunState>();
+
+  private createLibraryScanRunId() {
+    const runId = randomUUID();
+    this.logger.debug(`Created library scan runId ${runId}`);
+    return { runId };
+  }
+
+  private getLibraryScanRunId(job: { data?: unknown }) {
+    if (!job.data || typeof job.data !== 'object') {
+      this.logger.debug('Library scan event received without job data; unable to extract runId');
+      return;
+    }
+
+    const runId = (job.data as { runId?: unknown }).runId;
+
+    if (typeof runId === 'string') {
+      return runId;
+    }
+
+    this.logger.debug(`Library scan event has non-string runId payload ${JSON.stringify(runId)}`);
+    return undefined;
+  }
+
+  private async ensureLibraryScanRunStarted(runId: string | undefined) {
+    if (!runId) {
+      this.logger.debug('Library scan runId missing during start; skipping healthcheck tracking');
+      return;
+    }
+
+    if (this.libraryScanRuns.has(runId)) {
+      return;
+    }
+
+    const {
+      library: {
+        scan: { healthCheckUrl },
+      },
+    } = await this.getConfig({ withCache: true });
+    const trimmedUrl = healthCheckUrl?.trim();
+
+    if (!trimmedUrl) {
+      this.logger.debug(`Library scan run ${runId} has no configured healthCheckUrl; skipping healthchecks`);
+      return;
+    }
+
+    this.logger.debug(`Starting library scan run ${runId} with healthCheckUrl ${trimmedUrl}`);
+
+    this.libraryScanRuns.set(runId, {
+      hasFailure: false,
+      healthCheckUrl: trimmedUrl,
+      pendingJobs: 0,
+    });
+
+    this.logger.log(`Sending library scan start healthcheck for run ${runId}`);
+    await this.sendLibraryScanHealthCheck(trimmedUrl, 'start', runId);
+  }
+
+  private startLibraryScanJob(runId: string | undefined) {
+    const state = this.getLibraryScanRun(runId);
+    if (!state) {
+      this.logger.debug(`No tracked library scan state for run ${runId}; skipping start counter`);
+      return;
+    }
+
+    state.pendingJobs += 1;
+    this.logger.debug(`Library scan job started for run ${runId}; pendingJobs=${state.pendingJobs}`);
+  }
+
+  private async completeLibraryScanJob(runId: string | undefined, failed = false) {
+    if (!runId) {
+      this.logger.debug('Library scan completion event missing runId; skipping counter decrement');
+      return;
+    }
+
+    const state = this.getLibraryScanRun(runId);
+    if (!state) {
+      this.logger.debug(`No tracked library scan state for run ${runId}; skipping completion`);
+      return;
+    }
+
+    if (failed) {
+      state.hasFailure = true;
+    }
+
+    state.pendingJobs -= 1;
+    this.logger.debug(`Library scan job completed for run ${runId}; pendingJobs=${state.pendingJobs} failed=${failed}`);
+
+    if (state.pendingJobs > 0) {
+      return;
+    }
+
+    if (state.pendingJobs < 0) {
+      this.logger.warn(`Library scan health check run ${runId} has negative pendingJobs; normalizing`);
+      this.libraryScanRuns.delete(runId);
+      return;
+    }
+
+    this.libraryScanRuns.delete(runId);
+    this.logger.log(`Library scan run ${runId} completed; sending ${state.hasFailure ? 'fail' : 'ping'} healthcheck`);
+
+    await this.sendLibraryScanHealthCheck(state.healthCheckUrl, state.hasFailure ? 'fail' : 'ping', runId);
+  }
+
+  private isTrackingLibraryScanJob(jobName: JobName) {
+    return (
+      jobName === JobName.LibraryScanQueueAll ||
+      jobName === JobName.LibraryDeleteCheck ||
+      jobName === JobName.LibrarySyncFilesQueueAll ||
+      jobName === JobName.LibrarySyncAssetsQueueAll ||
+      jobName === JobName.LibrarySyncFiles ||
+      jobName === JobName.LibrarySyncAssets ||
+      jobName === JobName.LibraryDelete
+    );
+  }
+
+  private getLibraryScanRun(runId: string | undefined) {
+    if (!runId) {
+      return;
+    }
+
+    return this.libraryScanRuns.get(runId);
+  }
+
+  private async sendLibraryScanHealthCheck(url: string, type: 'start' | 'ping' | 'fail', runId: string) {
+    const endpointWithRunId = this.getLibraryScanHealthCheckEndpoint(url, type, runId);
+    const endpointWithoutRunId = this.getLibraryScanHealthCheckEndpoint(url, type);
+    const endpoints = [endpointWithRunId];
+    this.logger.debug(`Sending library scan healthcheck type=${type} runId=${runId} baseUrl=${url}`);
+
+    if (endpointWithoutRunId !== endpointWithRunId) {
+      endpoints.push(endpointWithoutRunId);
+    }
+
+    try {
+      for (const endpoint of endpoints) {
+        this.logger.debug(`Trying healthcheck endpoint ${endpoint}`);
+        const response = await fetch(endpoint, {
+          method: 'POST',
+          signal: AbortSignal.timeout(15000),
+        });
+        const responseText = await response.text();
+
+        if (response.ok) {
+          this.logger.log(`Healthcheck ${type} accepted for run ${runId} at ${endpoint}`);
+          return;
+        }
+
+        if (
+          endpoint === endpointWithRunId &&
+          response.status === 400 &&
+          responseText.toLowerCase().includes('invalid uuid')
+        ) {
+          this.logger.debug(`Healthcheck ${type} run ${runId} rejected due invalid uuid; retrying without rid`);
+          continue;
+        }
+
+        this.logger.warn(
+          `Failed to send library scan health check "${type}" to "${endpoint}" (${response.status}): ${response.statusText} / ${responseText}`,
+        );
+        return;
+      }
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : `${error}`;
+      this.logger.warn(`Failed to send library scan health check "${type}" to "${url}": ${errorMessage}`);
+    }
+  }
+
+  private getLibraryScanHealthCheckEndpoint(url: string, type: 'start' | 'ping' | 'fail', runId?: string) {
+    const trimmedUrl = url.endsWith('/') ? url.slice(0, -1) : url;
+
+    let endpoint = trimmedUrl;
+    if (type === 'start') {
+      endpoint = `${trimmedUrl}/start`;
+    }
+
+    if (type === 'fail') {
+      endpoint = `${trimmedUrl}/fail`;
+    }
+
+    if (type === 'ping') {
+      endpoint = trimmedUrl;
+    }
+
+    if (!runId) {
+      return endpoint;
+    }
+
+    const separator = endpoint.includes('?') ? '&' : '?';
+    return `${endpoint}${separator}rid=${runId}`;
+  }
+
+  @OnEvent({ name: 'JobStart', workers: [ImmichWorker.Microservices] })
+  async onLibraryScanJobStart(...[, job]: ArgsOf<'JobStart'>) {
+    if (!this.isTrackingLibraryScanJob(job.name)) {
+      return;
+    }
+
+    const runId = this.getLibraryScanRunId(job);
+    this.logger.debug(`JobStart for library scan job ${job.name} runId=${runId}`);
+    await this.ensureLibraryScanRunStarted(runId);
+    this.startLibraryScanJob(runId);
+  }
+
+  @OnEvent({ name: 'JobSuccess', workers: [ImmichWorker.Microservices] })
+  async onLibraryScanJobSuccess({ job }: ArgOf<'JobSuccess'>) {
+    if (!this.isTrackingLibraryScanJob(job.name)) {
+      return;
+    }
+
+    const runId = this.getLibraryScanRunId(job);
+    this.logger.debug(`JobSuccess for library scan job ${job.name} runId=${runId}`);
+    await this.completeLibraryScanJob(runId);
+  }
+
+  @OnEvent({ name: 'JobError', workers: [ImmichWorker.Microservices] })
+  async onLibraryScanJobError({ job }: ArgOf<'JobError'>) {
+    if (!this.isTrackingLibraryScanJob(job.name)) {
+      return;
+    }
+
+    const runId = this.getLibraryScanRunId(job);
+    this.logger.debug(`JobError for library scan job ${job.name} runId=${runId}`);
+    await this.completeLibraryScanJob(runId, true);
+  }
 
   @OnEvent({ name: 'ConfigInit', workers: [ImmichWorker.Microservices] })
   async onConfigInit({
@@ -54,12 +286,27 @@ export class LibraryService extends BaseService {
     this.watchLibraries = this.lock && watch.enabled;
 
     if (this.lock) {
+      this.logger.debug(`Library cron enabled=${scan.enabled}; expression=${scan.cronExpression}`);
       this.cronRepository.create({
         name: CronJob.LibraryScan,
         expression: scan.cronExpression,
-        onTick: () => handlePromiseError(this.jobRepository.queue({ name: JobName.LibraryScanQueueAll }), this.logger),
+        onTick: () =>
+          handlePromiseError(
+            this.jobRepository.queue({
+              name: JobName.LibraryScanQueueAll,
+              data: this.createLibraryScanRunId(),
+            }),
+            this.logger,
+          ),
         start: scan.enabled,
       });
+    }
+
+    const trimmedHealthCheckUrl = scan.healthCheckUrl?.trim();
+    if (trimmedHealthCheckUrl) {
+      this.logger.log(`Library scan health check URL configured: ${trimmedHealthCheckUrl}`);
+    } else {
+      this.logger.debug('Library scan health check URL is not configured.');
     }
 
     if (this.watchLibraries) {
@@ -213,7 +460,7 @@ export class LibraryService extends BaseService {
   }
 
   @OnJob({ name: JobName.LibraryDeleteCheck, queue: QueueName.Library })
-  async handleQueueCleanup(): Promise<JobStatus> {
+  async handleQueueCleanup(job: JobOf<JobName.LibraryDeleteCheck>): Promise<JobStatus> {
     this.logger.log('Checking for any libraries pending deletion...');
     const pendingDeletions = await this.libraryRepository.getAllDeleted();
     if (pendingDeletions.length > 0) {
@@ -221,7 +468,10 @@ export class LibraryService extends BaseService {
       this.logger.log(`Found ${pendingDeletions.length} ${libraryString} pending deletion, cleaning up...`);
 
       await this.jobRepository.queueAll(
-        pendingDeletions.map((libraryToDelete) => ({ name: JobName.LibraryDelete, data: { id: libraryToDelete.id } })),
+        pendingDeletions.map((libraryToDelete) => ({
+          name: JobName.LibraryDelete,
+          data: { id: libraryToDelete.id, runId: job.runId },
+        })),
       );
     }
 
@@ -433,27 +683,31 @@ export class LibraryService extends BaseService {
   async queueScan(id: string) {
     await this.findOrFail(id);
 
+    const { runId } = this.createLibraryScanRunId();
     this.logger.log(`Starting to scan library ${id}`);
 
     await this.jobRepository.queue({
       name: JobName.LibrarySyncFilesQueueAll,
       data: {
         id,
+        runId,
       },
     });
 
-    await this.jobRepository.queue({ name: JobName.LibrarySyncAssetsQueueAll, data: { id } });
+    await this.jobRepository.queue({ name: JobName.LibrarySyncAssetsQueueAll, data: { id, runId } });
   }
 
   async queueScanAll() {
-    await this.jobRepository.queue({ name: JobName.LibraryScanQueueAll, data: {} });
+    const { runId } = this.createLibraryScanRunId();
+    await this.jobRepository.queue({ name: JobName.LibraryScanQueueAll, data: { runId } });
   }
 
   @OnJob({ name: JobName.LibraryScanQueueAll, queue: QueueName.Library })
-  async handleQueueScanAll(): Promise<JobStatus> {
+  async handleQueueScanAll(job: JobOf<JobName.LibraryScanQueueAll>): Promise<JobStatus> {
+    const runId = job?.runId;
     this.logger.log(`Initiating scan of all external libraries...`);
 
-    await this.jobRepository.queue({ name: JobName.LibraryDeleteCheck, data: {} });
+    await this.jobRepository.queue({ name: JobName.LibraryDeleteCheck, data: { runId } });
 
     const libraries = await this.libraryRepository.getAll(true);
 
@@ -462,14 +716,17 @@ export class LibraryService extends BaseService {
         name: JobName.LibrarySyncFilesQueueAll,
         data: {
           id: library.id,
+          runId,
         },
       })),
     );
+
     await this.jobRepository.queueAll(
       libraries.map((library) => ({
         name: JobName.LibrarySyncAssetsQueueAll,
         data: {
           id: library.id,
+          runId,
         },
       })),
     );
@@ -667,6 +924,7 @@ export class LibraryService extends BaseService {
             libraryId: library.id,
             paths,
             progressCounter: crawlCount,
+            runId: job.runId,
           },
         });
       }
@@ -748,6 +1006,7 @@ export class LibraryService extends BaseService {
             assetIds: chunk.map((id) => id),
             progressCounter: count,
             totalAssets: assetCount,
+            runId: job.runId,
           },
         });
         chunk = [];

@@ -226,6 +226,7 @@ export type JobOf<T extends JobName> = Jobs[T];
 export interface IBaseJob {
   force?: boolean;
   priority?: number;
+  runId?: string;
 }
 
 export interface IDelayedJob extends IBaseJob {
@@ -244,14 +245,14 @@ export interface IAssetDeleteJob extends IEntityJob {
   deleteOnDisk: boolean;
 }
 
-export interface ILibraryFileJob {
+export interface ILibraryFileJob extends IBaseJob {
   libraryId: string;
   paths: string[];
   progressCounter?: number;
   totalAssets?: number;
 }
 
-export interface ILibraryBulkIdsJob {
+export interface ILibraryBulkIdsJob extends IBaseJob {
   libraryId: string;
   importPaths: string[];
   exclusionPatterns: string[];

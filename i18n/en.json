@@ -128,6 +128,8 @@
     "library_folder_description": "Specify a folder to import. This folder, including subfolders, will be scanned for images and videos.",
     "library_remove_exclusion_pattern_prompt": "Are you sure you want to remove this exclusion pattern?",
     "library_remove_folder_prompt": "Are you sure you want to remove this import folder?",
+    "library_scan_health_check_url": "Healthchecks ping URL",
+    "library_scan_health_check_url_description": "HTTP endpoint used for scan lifecycle events. /start and /fail are sent for start/failure while success sends ping at the base URL.",
     "library_scanning": "Periodic Scanning",
     "library_scanning_description": "Configure periodic library scanning",
     "library_scanning_enable_description": "Enable periodic library scanning",

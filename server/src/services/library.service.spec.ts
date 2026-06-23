@@ -843,11 +843,12 @@ describe(LibraryService.name, () => {
       const library2 = factory.library({ deletedAt: new Date() });
 
       mocks.library.getAllDeleted.mockResolvedValue([library1, library2]);
-      await expect(sut.handleQueueCleanup()).resolves.toBe(JobStatus.Success);
+      const runId = 'cleanup-run-id';
+      await expect(sut.handleQueueCleanup({ runId })).resolves.toBe(JobStatus.Success);
 
       expect(mocks.job.queueAll).toHaveBeenCalledWith([
-        { name: JobName.LibraryDelete, data: { id: library1.id } },
-        { name: JobName.LibraryDelete, data: { id: library2.id } },
+        { name: JobName.LibraryDelete, data: expect.objectContaining({ id: library1.id, runId }) },
+        { name: JobName.LibraryDelete, data: expect.objectContaining({ id: library2.id, runId }) },
       ]);
     });
   });
@@ -1139,11 +1140,11 @@ describe(LibraryService.name, () => {
       expect(mocks.job.queue).toHaveBeenCalledTimes(2);
       expect(mocks.job.queue).toHaveBeenCalledWith({
         name: JobName.LibrarySyncFilesQueueAll,
-        data: { id: library.id },
+        data: expect.objectContaining({ id: library.id }),
       });
       expect(mocks.job.queue).toHaveBeenCalledWith({
         name: JobName.LibrarySyncAssetsQueueAll,
-        data: { id: library.id },
+        data: expect.objectContaining({ id: library.id }),
       });
     });
   });
@@ -1154,15 +1155,50 @@ describe(LibraryService.name, () => {
 
       mocks.library.getAll.mockResolvedValue([library]);
 
-      await expect(sut.handleQueueScanAll()).resolves.toBe(JobStatus.Success);
+      const runId = 'queue-all-run-id';
+      await expect(sut.handleQueueScanAll({ runId })).resolves.toBe(JobStatus.Success);
 
       expect(mocks.job.queue).toHaveBeenCalledWith({
         name: JobName.LibraryDeleteCheck,
-        data: {},
+        data: { runId },
       });
       expect(mocks.job.queueAll).toHaveBeenCalledWith([
-        { name: JobName.LibrarySyncFilesQueueAll, data: { id: library.id } },
+        { name: JobName.LibrarySyncFilesQueueAll, data: expect.objectContaining({ id: library.id, runId }) },
       ]);
+    });
+  });
+
+  describe('sendLibraryScanHealthCheck', () => {
+    it('should retry without runId when server does not accept it', async () => {
+      const runId = 'run-id';
+      const healthCheckUrl = 'https://health.nakarmamana.ch/ping/0a2d667f-e3b0-4121-ab05-b8c7e4030034';
+      const originalFetch = globalThis.fetch;
+
+      const fetchMock = vi
+        .fn()
+        .mockResolvedValueOnce(new Response('invalid uuid for format', { status: 400 }))
+        .mockResolvedValueOnce(new Response('OK', { status: 200 }));
+      globalThis.fetch = fetchMock;
+
+      try {
+        const service = sut as unknown as {
+          sendLibraryScanHealthCheck: (url: string, type: 'start' | 'ping' | 'fail', runId: string) => Promise<void>;
+        };
+
+        await service.sendLibraryScanHealthCheck(healthCheckUrl, 'start', runId);
+
+        expect(fetchMock).toHaveBeenCalledTimes(2);
+        expect(fetchMock).toHaveBeenNthCalledWith(1, `${healthCheckUrl}/start?rid=${runId}`, {
+          method: 'POST',
+          signal: expect.any(AbortSignal),
+        });
+        expect(fetchMock).toHaveBeenNthCalledWith(2, `${healthCheckUrl}/start`, {
+          method: 'POST',
+          signal: expect.any(AbortSignal),
+        });
+      } finally {
+        globalThis.fetch = originalFetch;
+      }
     });
   });
 

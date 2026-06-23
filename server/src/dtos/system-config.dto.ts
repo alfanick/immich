@@ -144,6 +144,14 @@ const SystemConfigLibraryScanSchema = z
   .object({
     enabled: configBool.describe('Enabled'),
     cronExpression: cronExpressionSchema,
+    healthCheckUrl: z
+      .string()
+      .trim()
+      .default('')
+      .describe('Optional health check URL for library scans')
+      .refine((url) => url.length === 0 || z.url().safeParse(url).success, {
+        error: 'Health check URL must be empty or a valid URL',
+      }),
   })
   .meta({ id: 'SystemConfigLibraryScanDto' });
 
